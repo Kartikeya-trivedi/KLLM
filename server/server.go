@@ -34,6 +34,16 @@ func Handler(s *engine.Scheduler) http.Handler {
 		fmt.Fprintln(w, "ok")
 	})
 
+	// Prometheus scrape endpoint (Grafana-ready) + JSON snapshot (UI / W&B).
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		s.Metrics().WriteProm(w)
+	})
+	mux.HandleFunc("GET /stats.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(s.Metrics().Snapshot())
+	})
+
 	// Browser playground (embedded; no external assets).
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {

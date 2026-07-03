@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -20,15 +21,29 @@ func main() {
 	reps := flag.Int("reps", 3, "repetitions (best reported)")
 	fused := flag.Bool("fused", true, "use fused kernels")
 	maxSeq := flag.Int64("max-seq", 512, "KV capacity")
+	asJSON := flag.Bool("json", false, "emit one JSON result object (for tools/wandb_bench.py)")
 	flag.Parse()
 
-	if err := run(*dllPath, *modelDir, *device, *promptLen, *steps, *reps, *fused, *maxSeq); err != nil {
+	if err := run(*dllPath, *modelDir, *device, *promptLen, *steps, *reps, *fused, *maxSeq, *asJSON); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
-func run(dllPath, modelDir string, device, promptLen, steps, reps int, fused bool, maxSeq int64) error {
+// Result is the machine-readable benchmark record (--json), consumed by the
+// W&B logger to track tok/s across kernel-optimization iterations.
+type Result struct {
+	Model      string  `json:"model"`
+	Fused      bool    `json:"fused"`
+	PromptLen  int     `json:"prompt_len"`
+	Steps      int     `json:"steps"`
+	Reps       int     `json:"reps"`
+	TTFTms     float64 `json:"ttft_ms"`
+	ITLms      float64 `json:"itl_ms"`
+	DecodeTPS  float64 `json:"decode_tok_s"`
+}
+
+func run(dllPath, modelDir string, device, promptLen, steps, reps int, fused bool, maxSeq int64, asJSON bool) error {
 	e, err := engine.New(dllPath, modelDir, engine.Options{Device: device, MaxSeq: maxSeq})
 	if err != nil {
 		return err
@@ -90,9 +105,22 @@ func run(dllPath, modelDir string, device, promptLen, steps, reps int, fused boo
 		}
 	}
 
+	res := Result{
+		Model:     modelDir,
+		Fused:     fused,
+		PromptLen: promptLen,
+		Steps:     steps,
+		Reps:      reps,
+		TTFTms:    float64(bestTTFT) / float64(time.Millisecond),
+		ITLms:     float64(bestITL) / float64(time.Millisecond),
+		DecodeTPS: float64(time.Second) / float64(bestITL),
+	}
+	if asJSON {
+		return json.NewEncoder(os.Stdout).Encode(res)
+	}
 	fmt.Printf("fused=%v prompt=%d steps=%d (best of %d reps, aggregate-timed)\n", fused, promptLen, steps, reps)
 	fmt.Printf("TTFT (prefill %d tok)  %v\n", promptLen, bestTTFT)
 	fmt.Printf("ITL avg               %v\n", bestITL)
-	fmt.Printf("decode                %.1f tok/s\n", float64(time.Second)/float64(bestITL))
+	fmt.Printf("decode                %.1f tok/s\n", res.DecodeTPS)
 	return nil
 }

@@ -58,7 +58,8 @@
 <header>
   <h1>kllm</h1>
   <span class="tag">Go + CUDA inference engine · token-stream playground</span>
-  <span style="margin-left:auto" class="tag"><span id="dot" class="dot"></span> <span id="health">checking…</span></span>
+  <span style="margin-left:auto" class="tag" id="serverstats"></span>
+  <span class="tag"><span id="dot" class="dot"></span> <span id="health">checking…</span></span>
 </header>
 
 <main>
@@ -102,11 +103,21 @@ const $ = id => document.getElementById(id);
 async function health() {
   try {
     const r = await fetch("healthz");
-    if (r.ok) { $("dot").classList.add("up"); $("health").textContent = "engine up"; return; }
+    if (r.ok) {
+      $("dot").classList.add("up"); $("health").textContent = "engine up";
+      try {
+        const s = await (await fetch("stats.json")).json();
+        $("serverstats").textContent =
+          `server · ${s.tokens_per_second.toFixed(0)} tok/s · ` +
+          `${s.tokens_total} tokens · ${s.running_sequences|0} running · ` +
+          `KV ${s.kv_blocks_used|0}/${s.kv_blocks_total|0}`;
+      } catch (e) {}
+      return;
+    }
   } catch (e) {}
-  $("dot").classList.remove("up"); $("health").textContent = "engine down";
+  $("dot").classList.remove("up"); $("health").textContent = "engine down"; $("serverstats").textContent = "";
 }
-health(); setInterval(health, 4000);
+health(); setInterval(health, 2000);
 
 $("rand").onclick = () => {
   const n = 4 + Math.floor(Math.random() * 12);

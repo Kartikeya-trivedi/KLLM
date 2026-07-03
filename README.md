@@ -84,6 +84,31 @@ Commands: `serve` (server + UI), `generate` (one-shot decode), `bench`
 (TTFT/ITL), `loadgen` (throughput sweep), `wbench` (matmul fp32-vs-W4),
 `inspect` (dump a checkpoint), `smoke` (walking skeleton).
 
+## Observability & experiment tracking
+
+The server exposes live metrics, and there's a Weights & Biases logger for
+tracking throughput across kernel-optimization iterations:
+
+- **`GET /metrics`** — Prometheus text format (Grafana-ready): tok/s, TTFT /
+  ITL / batch-size histograms, running/queued sequences, KV utilization,
+  token and request counters. Dependency-free (hand-rolled exposition).
+- **`GET /stats.json`** — the same as a JSON snapshot; the browser UI polls
+  it to show live server-wide tok/s.
+- **`tools/wandb_bench.py`** — runs `cmd/bench` across configs and logs
+  `decode_tok_s` (+ TTFT/ITL) to W&B, tagged by kernel version, so each
+  kernel change shows up as a tracked delta. Also a `--serve-url` live mode
+  that streams a running server's tok/s to W&B. Runs without W&B installed
+  (prints the numbers); `pip install wandb && wandb login` to log.
+
+```powershell
+python tools\wandb_bench.py --tag naive-w4-kernel     # baseline run
+# ... optimize the kernel ...
+python tools\wandb_bench.py --tag tiled-w4-kernel      # W&B charts the gain
+```
+
+For reference, real Gemma-3 speeds to calibrate targets against are in
+[docs/JOURNAL.md](docs/JOURNAL.md#external-reference-gemma-inference-speed).
+
 ## The build, in phases
 
 Each phase is independently demoable and gated on matching the oracle before
