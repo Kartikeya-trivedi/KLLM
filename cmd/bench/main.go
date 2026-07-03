@@ -29,7 +29,7 @@ func main() {
 }
 
 func run(dllPath, modelDir string, device, promptLen, steps, reps int, fused bool, maxSeq int64) error {
-	e, err := engine.New(dllPath, modelDir, device, maxSeq)
+	e, err := engine.New(dllPath, modelDir, engine.Options{Device: device, MaxSeq: maxSeq})
 	if err != nil {
 		return err
 	}
@@ -56,7 +56,9 @@ func run(dllPath, modelDir string, device, promptLen, steps, reps int, fused boo
 		t0 := time.Now()
 		var logits []float32
 		for range prefills {
-			logits, err = e.Prefill(prompt)
+			seq := e.NewSequence()
+			logits, err = seq.Forward(prompt)
+			seq.Release()
 			if err != nil {
 				return err
 			}
@@ -64,21 +66,21 @@ func run(dllPath, modelDir string, device, promptLen, steps, reps int, fused boo
 		ttft := time.Since(t0) / prefills
 
 		// One more prefill so decode timing starts from a clean sequence.
-		logits, err = e.Prefill(prompt)
+		seq := e.NewSequence()
+		logits, err = seq.Forward(prompt)
 		if err != nil {
 			return err
 		}
-		pos := promptLen
 		t1 := time.Now()
 		for range steps {
 			next := engine.Argmax(logits)
-			logits, err = e.B.Forward([]int32{next}, pos)
+			logits, err = seq.Forward([]int32{next})
 			if err != nil {
 				return err
 			}
-			pos++
 		}
 		itl := time.Since(t1) / time.Duration(steps)
+		seq.Release()
 
 		if r == 0 || ttft < bestTTFT {
 			bestTTFT = ttft

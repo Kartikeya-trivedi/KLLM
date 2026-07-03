@@ -1,32 +1,58 @@
 // Package engine ties the pieces together: load a checkpoint through the
-// backend and run greedy decode.
+// backend, manage paged-KV sequences, and run decode.
 package engine
 
 import (
 	"fmt"
 
 	"kllm/engine/backend"
+	"kllm/engine/kv"
 	"kllm/engine/loader"
 	"kllm/models"
 )
 
+// Options sizes the engine. Zero values get sensible lab defaults.
+type Options struct {
+	Device     int
+	MaxSeq     int64 // per-sequence cap AND max concatenated tokens per step
+	BlockSize  int   // KV block size in tokens
+	NumBlocks  int   // KV pool size; default fits ~4 max-length sequences
+}
+
+func (o *Options) fill() {
+	if o.MaxSeq == 0 {
+		o.MaxSeq = 256
+	}
+	if o.BlockSize == 0 {
+		o.BlockSize = 16
+	}
+	if o.NumBlocks == 0 {
+		o.NumBlocks = 4 * int(o.MaxSeq) / o.BlockSize
+	}
+}
+
 type Engine struct {
-	B   *backend.Handle
-	Cfg *models.HFConfig
+	B     *backend.Handle
+	Cfg   *models.HFConfig
+	Alloc *kv.Allocator
 }
 
 // New loads the backend library, creates the model from modelDir
 // (config.json + safetensors), uploads all weights, and finalizes.
-func New(dllPath, modelDir string, device int, maxSeq int64) (*Engine, error) {
+func New(dllPath, modelDir string, opts Options) (*Engine, error) {
+	opts.fill()
 	cfg, err := models.LoadConfig(modelDir)
 	if err != nil {
 		return nil, err
 	}
-	h, err := backend.Load(dllPath, device)
+	h, err := backend.Load(dllPath, opts.Device)
 	if err != nil {
 		return nil, err
 	}
-	if err := h.ModelCreate(cfg.Backend(maxSeq)); err != nil {
+	bcfg := cfg.Backend(opts.MaxSeq)
+	bcfg.KVBlockSize = int64(opts.BlockSize)
+	bcfg.KVNumBlocks = int64(opts.NumBlocks)
+	if err := h.ModelCreate(bcfg); err != nil {
 		h.Close()
 		return nil, err
 	}
@@ -56,25 +82,62 @@ func New(dllPath, modelDir string, device int, maxSeq int64) (*Engine, error) {
 		h.Close()
 		return nil, err
 	}
-	return &Engine{B: h, Cfg: cfg}, nil
+	return &Engine{B: h, Cfg: cfg, Alloc: kv.NewAllocator(opts.NumBlocks, opts.BlockSize)}, nil
 }
 
-// Prefill resets the KV cache and runs the prompt; returns last-token logits.
-func (e *Engine) Prefill(prompt []int32) ([]float32, error) {
-	if err := e.B.ResetKV(); err != nil {
+// Sequence is one generation stream: its KV block table plus position.
+type Sequence struct {
+	e   *Engine
+	kvs *kv.Sequence
+}
+
+func (e *Engine) NewSequence() *Sequence {
+	return &Sequence{e: e, kvs: e.Alloc.NewSequence()}
+}
+
+// Step exposes the sequence's batch descriptor for the given new tokens,
+// reserving KV blocks. The scheduler composes these into ForwardBatch calls;
+// call Commit after the forward succeeds.
+func (s *Sequence) Step(tokens []int32) (backend.SeqForward, error) {
+	if err := s.kvs.Reserve(len(tokens)); err != nil {
+		return backend.SeqForward{}, err
+	}
+	return backend.SeqForward{Tokens: tokens, Pos: s.kvs.Len, BlockTable: s.kvs.Table}, nil
+}
+
+// Commit records tokens written by a successful forward.
+func (s *Sequence) Commit(n int) { s.kvs.Commit(n) }
+
+// Len is the sequence's current KV length in tokens.
+func (s *Sequence) Len() int { return s.kvs.Len }
+
+// Forward runs this sequence alone (batch of one) and commits.
+func (s *Sequence) Forward(tokens []int32) ([]float32, error) {
+	sf, err := s.Step(tokens)
+	if err != nil {
 		return nil, err
 	}
-	return e.B.Forward(prompt, 0)
+	logits, err := s.e.B.ForwardBatch([]backend.SeqForward{sf})
+	if err != nil {
+		return nil, err
+	}
+	s.Commit(len(tokens))
+	return logits[0], nil
 }
+
+// Release returns the sequence's KV blocks to the pool.
+func (s *Sequence) Release() { s.kvs.Release() }
 
 // Generate greedy-decodes up to maxNewTokens after the prompt, stopping at
 // the model's EOS id (if it has one).
 func (e *Engine) Generate(prompt []int32, maxNewTokens int) ([]int32, error) {
-	logits, err := e.Prefill(prompt)
+	seq := e.NewSequence()
+	defer seq.Release()
+
+	logits, err := seq.Forward(prompt)
 	if err != nil {
 		return nil, err
 	}
-	pos := len(prompt)
 	var out []int32
 	for range maxNewTokens {
 		next := Argmax(logits)
@@ -82,11 +145,10 @@ func (e *Engine) Generate(prompt []int32, maxNewTokens int) ([]int32, error) {
 		if e.Cfg.EOSTokenID >= 0 && int64(next) == e.Cfg.EOSTokenID {
 			break
 		}
-		logits, err = e.B.Forward([]int32{next}, pos)
+		logits, err = seq.Forward([]int32{next})
 		if err != nil {
 			return out, err
 		}
-		pos++
 	}
 	return out, nil
 }

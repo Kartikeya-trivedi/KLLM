@@ -36,7 +36,7 @@ func run(dllPath, modelDir string, device int, ids string, steps int, maxSeq int
 		prompt = append(prompt, int32(v))
 	}
 
-	e, err := engine.New(dllPath, modelDir, device, maxSeq)
+	e, err := engine.New(dllPath, modelDir, engine.Options{Device: device, MaxSeq: maxSeq})
 	if err != nil {
 		return err
 	}

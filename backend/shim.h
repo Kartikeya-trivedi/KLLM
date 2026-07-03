@@ -54,6 +54,9 @@ typedef struct TeModelConfig {
     int64_t moe_intermediate;  // per-expert FFN width
     int64_t router_mode;       // 0 = softmax top-k renorm (Mixtral/Qwen),
                                // 1 = sigmoid + expert-bias norm (Sarvam/DSv3)
+    // Paged KV
+    int64_t kv_block_size;  // tokens per KV block (e.g. 16)
+    int64_t kv_num_blocks;  // pool size; VRAM = layers*2*num_blocks*block*kv_dim*4B
     double rope_theta;
     double rms_eps;
 } TeModelConfig;
@@ -70,13 +73,21 @@ TE_API int te_model_load_tensor(const char* name, const float* data, int64_t num
 // cache and scratch. After this the model is immutable and ready to run.
 TE_API int te_model_finalize(void);
 
-// Run the forward pass for n tokens starting at absolute position pos
-// (pos == current KV length; prefill passes n>1, decode passes n=1).
-// Writes vocab-size logits for the LAST token into logits_out (host buffer).
-TE_API int te_forward(const int32_t* tokens, int64_t n, int64_t pos, float* logits_out);
+// Maximum sequences per forward_step batch (bounds host/device staging).
+#define TE_MAX_BATCH_SEQS 128
 
-// Drop all cached KV (start a fresh sequence).
-TE_API int te_reset_kv(void);
+// Run one forward step for a batch of sequences. The backend is stateless
+// about sequences: Go owns block tables and positions.
+//   tokens          concatenated new tokens for all sequences
+//   n_tokens[s]     new-token count of sequence s (prefill >1, decode ==1)
+//   pos[s]          absolute start position of sequence s's new tokens
+//   block_tables    [n_seqs][max_blocks_per_seq] physical KV block ids;
+//                   entries beyond a sequence's needs are ignored
+//   logits_out      [n_seqs][vocab] logits of each sequence's LAST new token
+TE_API int te_forward_batch(int64_t n_seqs, const int32_t* tokens,
+                            const int32_t* n_tokens, const int32_t* pos,
+                            const int32_t* block_tables,
+                            int64_t max_blocks_per_seq, float* logits_out);
 
 // Toggle fused kernels (residual-add + RMSNorm). Default on; the unfused
 // path exists so speedups can be measured honestly in one binary.
