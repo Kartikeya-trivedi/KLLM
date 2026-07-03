@@ -6,6 +6,13 @@ what a transformer is but not how serving one efficiently works. Every
 concept here maps to code and to a phase in [PLAN.md](PLAN.md); the measured
 results are in [JOURNAL.md](JOURNAL.md).
 
+> **Want the deep version?** [docs/theory/](theory/README.md) is a
+> seven-chapter graduate primer — full math, derivations (RoPE's
+> relative-position proof, the KV-cache correctness argument, the
+> speculative-decoding acceptance proof, quantization error analysis, the
+> roofline formalism), complexity accounting, and reading lists. This file
+> is the executive summary; that one is the course.
+
 ---
 
 ## 1. Autoregressive decoding, and why it has two phases
