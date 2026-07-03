@@ -39,10 +39,24 @@ directly.
 - **Portable + real-Ampere gated.** Windows (syscall loader, sm_75) for the
   inner loop; Linux (cgo loader, sm_86) verified on cloud A10G via Modal.
 
-Kernels are currently **naive-but-correct on purpose** — the whole system is
-green, and kernel optimization (W4 matmul, paged FlashAttention, fused
-grouped-GEMM, CUDA graphs) is the deliberate endgame, each with a measured
-baseline and a correctness net that catches any regression.
+- **Real models on real GPUs** (single A100 via Modal, all matching
+  HuggingFace token-for-token): **TinyLlama-1.1B**, **Sarvam-1 2B**, and
+  **Gemma 3 1B** — the latter needed genuine architecture work (qk-norm,
+  sandwich norms, GELU-tanh, sliding-window attention with dual RoPE theta),
+  all validated by the per-layer oracle.
+
+**Kernel optimization runs as a measured loop** — change one kernel, the
+full oracle suite must stay green, benchmark, log, plot:
+
+![kernel optimization progress](docs/assets/kernel_progress.png)
+
+Attempt 1 (coalesced W4 matmul) flips the W4 kernel from 0.13–0.37× of
+cuBLAS fp32 to **1.7–2.0×**; attempt 3 (block-parallel paged attention)
+doubles end-to-end decode at seq≈512. Attempt 2 (vectorized loads) measured
+*slower* on Turing and is logged as the honest regression it is. Data:
+[bench/kernel_attempts.json](bench/kernel_attempts.json); remaining levers
+(shared-memory X staging, multi-row blocks, CUDA graphs) in the
+[journal](docs/JOURNAL.md).
 
 ## Try it in your browser (no GPU needed locally)
 

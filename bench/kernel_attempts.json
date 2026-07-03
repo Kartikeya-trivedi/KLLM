@@ -14,12 +14,24 @@
     { "gpu": "GTX 1650", "shape": "11008x4096", "kernel": "fp32 cuBLAS", "attempt": null, "ms": 1.585, "gbps": 113.8 },
     { "gpu": "GTX 1650", "shape": "11008x4096", "kernel": "w4 naive", "attempt": 0, "ms": 12.679, "gbps": 1.9 },
     { "gpu": "GTX 1650", "shape": "11008x4096", "kernel": "w4 v1", "attempt": 1, "ms": 0.813, "gbps": 29.5 },
-    { "gpu": "GTX 1650", "shape": "11008x4096", "kernel": "w4 v2", "attempt": 2, "ms": 1.085, "gbps": 22.1 }
+    { "gpu": "GTX 1650", "shape": "11008x4096", "kernel": "w4 v2", "attempt": 2, "ms": 1.085, "gbps": 22.1 },
+    { "gpu": "A10 sm_86", "shape": "4096x4096", "kernel": "fp32 cuBLAS", "attempt": null, "ms": 0.137, "gbps": 489.7 },
+    { "gpu": "A10 sm_86", "shape": "4096x4096", "kernel": "w4 naive", "attempt": 0, "ms": 0.675, "gbps": 13.2 },
+    { "gpu": "A10 sm_86", "shape": "4096x4096", "kernel": "w4 v1", "attempt": 1, "ms": 0.057, "gbps": 155.4 },
+    { "gpu": "A10 sm_86", "shape": "4096x4096", "kernel": "w4 v2", "attempt": 2, "ms": 0.052, "gbps": 171.4 },
+    { "gpu": "A10 sm_86", "shape": "11008x4096", "kernel": "fp32 cuBLAS", "attempt": null, "ms": 0.359, "gbps": 502.5 },
+    { "gpu": "A10 sm_86", "shape": "11008x4096", "kernel": "w4 naive", "attempt": 0, "ms": 0.677, "gbps": 35.4 },
+    { "gpu": "A10 sm_86", "shape": "11008x4096", "kernel": "w4 v1", "attempt": 1, "ms": 0.146, "gbps": 163.9 },
+    { "gpu": "A10 sm_86", "shape": "11008x4096", "kernel": "w4 v2", "attempt": 2, "ms": 0.132, "gbps": 181.1 }
   ],
   "model_bench": [
     { "gpu": "GTX 1650", "model": "tiny-llama-w4 (prompt 128, 384 steps)", "attempt": 0, "tok_s": 916.4, "itl_ms": 1.091 },
     { "gpu": "GTX 1650", "model": "tiny-llama-w4 (prompt 128, 384 steps)", "attempt": 1, "tok_s": 913.6, "itl_ms": 1.095 },
     { "gpu": "GTX 1650", "model": "tiny-llama-w4 (prompt 128, 384 steps)", "attempt": 2, "tok_s": 909.5, "itl_ms": 1.099 },
-    { "gpu": "GTX 1650", "model": "tiny-llama-w4 (prompt 128, 384 steps)", "attempt": 3, "tok_s": 1958.1, "itl_ms": 0.511 }
+    { "gpu": "GTX 1650", "model": "tiny-llama-w4 (prompt 128, 384 steps)", "attempt": 3, "tok_s": 1958.1, "itl_ms": 0.511 },
+    { "gpu": "A100 40GB", "model": "TinyLlama-1.1B fp32, single-stream", "attempt": 0, "tok_s": 48.3, "itl_ms": 20.695 },
+    { "gpu": "A100 40GB", "model": "TinyLlama-1.1B fp32, single-stream", "attempt": 3, "tok_s": 144.9, "itl_ms": 6.9 },
+    { "gpu": "A100 40GB", "model": "TinyLlama-1.1B fp32, aggregate conc=32", "attempt": 0, "tok_s": 1210.9, "itl_ms": null },
+    { "gpu": "A100 40GB", "model": "TinyLlama-1.1B fp32, aggregate conc=32", "attempt": 3, "tok_s": 1804.4, "itl_ms": null }
   ]
 }

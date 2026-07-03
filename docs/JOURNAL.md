@@ -420,6 +420,28 @@ Readings:
   achievable bandwidth (cuBLAS reaches ~114 GB/s) — next levers are
   shared-memory X staging, multiple rows per block, and float4 X loads.
 
+**Ampere results (A10 sm_86 wbench; A100 model-level; full suite green on
+both):**
+
+| kernel | 4096x4096 (A10) | 11008x4096 (A10) |
+|--------|----------------:|-----------------:|
+| fp32 cuBLAS | 490 GB/s | 502 GB/s |
+| w4 naive | 13 GB/s (0.20x) | 35 GB/s (0.53x) |
+| w4 v1 coalesced | 155 GB/s (2.39x) | 164 GB/s (2.46x) |
+| w4 v2 vectorized | **171 GB/s (2.64x)** | **181 GB/s (2.71x)** |
+
+- **v2 wins on Ampere** (2.64–2.71x vs fp32) after losing on Turing — the
+  arch-dependent flip is exactly why versions stay selectable and measured
+  per GPU rather than assumed.
+- **Model-level, A100, TinyLlama-1.1B fp32** (attention kernel is what
+  applies to an fp32 model): single-stream **48.3 → 144.9 tok/s (3.0x)**,
+  ITL 20.7 → 6.9 ms (effective weight bandwidth ~213 → ~638 GB/s);
+  aggregate at conc 32: 1211 → **1804 tok/s**; correctness still 16/16 vs HF.
+- Single-stream 145 tok/s for a 1.1B fp32 now clears the hosted
+  Gemma-3-27B provider band (15–67 tok/s) instead of merely touching it —
+  and the remaining fp32→W4 lever (4x fewer weight bytes at 2.6x higher
+  kernel efficiency) is measured and waiting.
+
 ## External reference — Gemma inference speed
 
 Collected to calibrate what "fast" means for a 30B-class model, so the
