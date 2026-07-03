@@ -20,8 +20,7 @@ type winImpl struct {
 	procModelCreate    *syscall.Proc
 	procLoadTensor     *syscall.Proc
 	procFinalize       *syscall.Proc
-	procForward        *syscall.Proc
-	procResetKV        *syscall.Proc
+	procForwardBatch   *syscall.Proc
 	procSetFusion      *syscall.Proc
 	procDebugSet       *syscall.Proc
 	procDebugCount     *syscall.Proc
@@ -50,8 +49,7 @@ func load(path string) (impl, error) {
 		{"te_model_create", &w.procModelCreate},
 		{"te_model_load_tensor", &w.procLoadTensor},
 		{"te_model_finalize", &w.procFinalize},
-		{"te_forward", &w.procForward},
-		{"te_reset_kv", &w.procResetKV},
+		{"te_forward_batch", &w.procForwardBatch},
 		{"te_set_fusion", &w.procSetFusion},
 		{"te_debug_set", &w.procDebugSet},
 		{"te_debug_count", &w.procDebugCount},
@@ -100,19 +98,38 @@ func (w *winImpl) finalize() error {
 	return w.check("te_model_finalize", rc)
 }
 
-func (w *winImpl) forward(tokens []int32, pos int, logits []float32) error {
-	rc, _, _ := w.procForward.Call(
+func (w *winImpl) forwardBatch(seqs []SeqForward, logits []float32) error {
+	// Flatten the batch into the C-ABI's parallel arrays.
+	var tokens []int32
+	nTokens := make([]int32, len(seqs))
+	pos := make([]int32, len(seqs))
+	mbps := 0
+	for i, s := range seqs {
+		tokens = append(tokens, s.Tokens...)
+		nTokens[i] = int32(len(s.Tokens))
+		pos[i] = int32(s.Pos)
+		if len(s.BlockTable) > mbps {
+			mbps = len(s.BlockTable)
+		}
+	}
+	tables := make([]int32, len(seqs)*mbps)
+	for i := range tables {
+		tables[i] = -1 // unreachable entries; backend validates only used slots
+	}
+	for i, s := range seqs {
+		copy(tables[i*mbps:], s.BlockTable)
+	}
+
+	rc, _, _ := w.procForwardBatch.Call(
+		uintptr(len(seqs)),
 		uintptr(unsafe.Pointer(&tokens[0])),
-		uintptr(len(tokens)),
-		uintptr(pos),
+		uintptr(unsafe.Pointer(&nTokens[0])),
+		uintptr(unsafe.Pointer(&pos[0])),
+		uintptr(unsafe.Pointer(&tables[0])),
+		uintptr(mbps),
 		uintptr(unsafe.Pointer(&logits[0])),
 	)
-	return w.check("te_forward", rc)
-}
-
-func (w *winImpl) resetKV() error {
-	rc, _, _ := w.procResetKV.Call()
-	return w.check("te_reset_kv", rc)
+	return w.check("te_forward_batch", rc)
 }
 
 func (w *winImpl) setFusion(on bool) error {

@@ -9,9 +9,11 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"kllm/engine"
+	"kllm/engine/backend"
 	"kllm/engine/npy"
 )
 
@@ -34,30 +36,49 @@ func repoPath(parts ...string) string {
 	return filepath.Join(append([]string{"..", ".."}, parts...)...)
 }
 
-func TestMatchesHFReference(t *testing.T) {
-	dll := repoPath("build", "toyengine_backend.dll")
-	model := repoPath("testmodels", "tiny-llama")
-	dumps := repoPath("refdumps", "tiny-llama")
-	for _, p := range []string{dll, model, dumps} {
-		if _, err := os.Stat(p); err != nil {
-			t.Skipf("missing %s — build the DLL and run make_test_model.py + gen_reference.py first", p)
+// One engine per test process: the backend allows a single model instance.
+var (
+	engOnce sync.Once
+	eng     *engine.Engine
+	engMan  manifest
+	engSkip string
+	engErr  error
+)
+
+func getEngine(t *testing.T) (*engine.Engine, manifest) {
+	t.Helper()
+	engOnce.Do(func() {
+		dll := repoPath("build", "toyengine_backend.dll")
+		model := repoPath("testmodels", "tiny-llama")
+		dumps := repoPath("refdumps", "tiny-llama")
+		for _, p := range []string{dll, model, dumps} {
+			if _, err := os.Stat(p); err != nil {
+				engSkip = fmt.Sprintf("missing %s — build the DLL and run make_test_model.py + gen_reference.py first", p)
+				return
+			}
 		}
+		raw, err := os.ReadFile(filepath.Join(dumps, "manifest.json"))
+		if err == nil {
+			err = json.Unmarshal(raw, &engMan)
+		}
+		if err != nil {
+			engErr = err
+			return
+		}
+		eng, engErr = engine.New(dll, model, engine.Options{MaxSeq: 256})
+	})
+	if engSkip != "" {
+		t.Skip(engSkip)
 	}
+	if engErr != nil {
+		t.Fatal(engErr)
+	}
+	return eng, engMan
+}
 
-	var man manifest
-	raw, err := os.ReadFile(filepath.Join(dumps, "manifest.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(raw, &man); err != nil {
-		t.Fatal(err)
-	}
-
-	e, err := engine.New(dll, model, 0, 256)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer e.Close()
+func TestMatchesHFReference(t *testing.T) {
+	e, man := getEngine(t)
+	dumps := repoPath("refdumps", "tiny-llama")
 	L := int(e.Cfg.NumHiddenLayers)
 
 	// Both kernel paths must match the oracle: fused (default) and unfused.
@@ -83,10 +104,12 @@ func runPrompts(t *testing.T, e *engine.Engine, dumps string, man manifest, L in
 			}
 
 			// --- Prefill with per-layer activation diff ---
+			seq := e.NewSequence()
+			defer seq.Release()
 			if err := e.B.DebugSet(true); err != nil {
 				t.Fatal(err)
 			}
-			logits, err := e.Prefill(ref.InputIDs)
+			logits, err := seq.Forward(ref.InputIDs)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -127,7 +150,6 @@ func runPrompts(t *testing.T, e *engine.Engine, dumps string, man manifest, L in
 				t.Fatal(err)
 			}
 			vocab := lshape[1]
-			pos := len(ref.InputIDs)
 			for step, wantTok := range ref.GeneratedIDs {
 				refRow := refLogits[step*vocab : (step+1)*vocab]
 				if d := maxAbsDiff(logits, refRow); d > logitsTol {
@@ -140,13 +162,90 @@ func runPrompts(t *testing.T, e *engine.Engine, dumps string, man manifest, L in
 				if step == len(ref.GeneratedIDs)-1 {
 					break
 				}
-				logits, err = e.B.Forward([]int32{gotTok}, pos)
+				logits, err = seq.Forward([]int32{gotTok})
 				if err != nil {
 					t.Fatal(err)
 				}
-				pos++
 			}
 		})
+	}
+}
+
+// TestPagedBatchMatchesSolo runs two prompts of different lengths through
+// ONE batched forward per step (paged KV, shared pool) and checks both token
+// streams still match HF exactly — cross-sequence isolation + batching.
+func TestPagedBatchMatchesSolo(t *testing.T) {
+	e, _ := getEngine(t)
+	dumps := repoPath("refdumps", "tiny-llama")
+
+	refs := make([]refTokens, 2)
+	for i := range refs {
+		raw, err := os.ReadFile(filepath.Join(dumps, fmt.Sprintf("prompt_%d", i), "tokens.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(raw, &refs[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seqs := []*engine.Sequence{e.NewSequence(), e.NewSequence()}
+	defer seqs[0].Release()
+	defer seqs[1].Release()
+
+	// Joint prefill: both prompts (different lengths) in one forward_step.
+	var batch []backend.SeqForward
+	for i, s := range seqs {
+		sf, err := s.Step(refs[i].InputIDs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		batch = append(batch, sf)
+	}
+	logits, err := e.B.ForwardBatch(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, s := range seqs {
+		s.Commit(len(refs[i].InputIDs))
+	}
+
+	// Joint decode: one batched step per token; sequences retire as their
+	// reference stream ends (a small preview of continuous batching).
+	next := []int32{engine.Argmax(logits[0]), engine.Argmax(logits[1])}
+	stepIdx := []int{0, 0}
+	active := []int{0, 1}
+	for len(active) > 0 {
+		var stillActive []int
+		batch = batch[:0]
+		for _, i := range active {
+			want := refs[i].GeneratedIDs[stepIdx[i]]
+			if next[i] != want {
+				t.Fatalf("seq %d step %d: token %d, HF got %d", i, stepIdx[i], next[i], want)
+			}
+			if stepIdx[i] == len(refs[i].GeneratedIDs)-1 {
+				continue // sequence finished; drops out of the batch
+			}
+			sf, err := seqs[i].Step([]int32{next[i]})
+			if err != nil {
+				t.Fatal(err)
+			}
+			batch = append(batch, sf)
+			stillActive = append(stillActive, i)
+		}
+		if len(stillActive) == 0 {
+			break
+		}
+		logits, err = e.B.ForwardBatch(batch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for bi, i := range stillActive {
+			seqs[i].Commit(1)
+			next[i] = engine.Argmax(logits[bi])
+			stepIdx[i]++
+		}
+		active = stillActive
 	}
 }
 

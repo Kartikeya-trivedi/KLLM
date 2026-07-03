@@ -30,16 +30,22 @@ struct Model {
 
     std::unordered_map<std::string, DeviceTensor> w;
 
-    // Contiguous KV cache: [n_layers][2 (k,v)][max_seq][kv_dim]
+    // Paged KV pool: [n_layers][2 (k,v)][num_blocks][block_size][kv_dim].
+    // Go owns block tables + free list; the backend is sequence-stateless.
     float* kv = nullptr;
-    int64_t kv_len = 0;  // tokens currently cached
 
-    // Scratch, sized for max_seq tokens in flight.
+    // Scratch, sized for max_seq concatenated tokens in flight.
     float *x = nullptr, *xn = nullptr, *q = nullptr, *k = nullptr, *v = nullptr;
     float *attn = nullptr, *proj = nullptr, *mlp_out = nullptr;
     float *ff_gate = nullptr, *ff_up = nullptr;
-    float* d_logits = nullptr;
-    int32_t* d_tokens = nullptr;
+    float *d_last_hidden = nullptr;  // [TE_MAX_BATCH_SEQS, hidden]
+    float* d_logits = nullptr;       // [TE_MAX_BATCH_SEQS, vocab]
+    int32_t* d_tokens = nullptr;     // per concat token
+    int32_t* d_positions = nullptr;  // per concat token: absolute position
+    int32_t* d_seq_ids = nullptr;    // per concat token: owning sequence
+    int32_t* d_tables = nullptr;     // [TE_MAX_BATCH_SEQS, max_blocks_per_seq_cap]
+    int32_t* d_last_idx = nullptr;   // per seq: concat row of its last token
+    int64_t tables_cap = 0;          // allocated entries in d_tables
 
     cublasHandle_t cublas = nullptr;
     bool fused = true;  // te_set_fusion
@@ -110,14 +116,15 @@ __global__ void add_rmsnorm_kernel(float* x, const float* res, float* out,
 
 // HF Llama RoPE (rotate_half): pairs (j, j+d/2) share inv_freq[j].
 // Angles computed in double to track the fp32 CPU reference closely.
-__global__ void rope_kernel(float* t, int64_t n_heads, int64_t head_dim,
-                            int64_t pos0, double theta) {
+// positions[] gives each concatenated token its absolute position.
+__global__ void rope_kernel(float* t, const int32_t* positions,
+                            int64_t n_heads, int64_t head_dim, double theta) {
     int64_t token = blockIdx.x;
     int64_t half = head_dim / 2;
     for (int64_t idx = threadIdx.x; idx < n_heads * half; idx += blockDim.x) {
         int64_t h = idx / half, j = idx % half;
         double freq = pow(theta, -2.0 * (double)j / (double)head_dim);
-        double ang = (double)(pos0 + token) * freq;
+        double ang = (double)positions[token] * freq;
         float c = (float)cos(ang), s = (float)sin(ang);
         float* base = t + token * (n_heads * head_dim) + h * head_dim;
         float a = base[j], b = base[j + half];
@@ -126,35 +133,49 @@ __global__ void rope_kernel(float* t, int64_t n_heads, int64_t head_dim,
     }
 }
 
-__global__ void kv_append_kernel(float* kcache, float* vcache, const float* k,
-                                 const float* v, int64_t pos0, int64_t kv_dim) {
+// Paged append: token t's KV rows land in its sequence's block table slot.
+__global__ void kv_append_paged_kernel(float* kpool, float* vpool,
+                                       const float* k, const float* v,
+                                       const int32_t* positions,
+                                       const int32_t* seq_ids,
+                                       const int32_t* tables, int64_t mbps,
+                                       int64_t block_size, int64_t kv_dim) {
     int64_t t = blockIdx.x;
+    int64_t p = positions[t];
+    int32_t phys = tables[(int64_t)seq_ids[t] * mbps + p / block_size];
+    int64_t dst = ((int64_t)phys * block_size + p % block_size) * kv_dim;
     for (int64_t i = threadIdx.x; i < kv_dim; i += blockDim.x) {
-        kcache[(pos0 + t) * kv_dim + i] = k[t * kv_dim + i];
-        vcache[(pos0 + t) * kv_dim + i] = v[t * kv_dim + i];
+        kpool[dst + i] = k[t * kv_dim + i];
+        vpool[dst + i] = v[t * kv_dim + i];
     }
 }
 
-// Deliberately naive causal attention: one thread per (query token, head).
-// Fine at lab scale; replaced by a paged, parallel kernel later.
+// Deliberately naive paged causal attention: one thread per (query token,
+// head), gathering K/V through the block table. Fine at lab scale; the
+// optimized tiled kernel is the deferred endgame.
 #define TE_ATTN_MAX_SEQ 4096
 #define TE_ATTN_MAX_HEAD_DIM 256
 
-__global__ void attn_naive_kernel(float* out, const float* q,
-                                  const float* kcache, const float* vcache,
-                                  int64_t pos0, int64_t n_heads, int64_t n_kv,
-                                  int64_t head_dim, int64_t kv_dim,
-                                  float scale) {
+__global__ void attn_paged_kernel(float* out, const float* q,
+                                  const float* kpool, const float* vpool,
+                                  const int32_t* positions,
+                                  const int32_t* seq_ids,
+                                  const int32_t* tables, int64_t mbps,
+                                  int64_t block_size, int64_t n_heads,
+                                  int64_t n_kv, int64_t head_dim,
+                                  int64_t kv_dim, float scale) {
     int64_t t = blockIdx.x, h = blockIdx.y;
     int64_t q_dim = n_heads * head_dim;
     int64_t kvh = h / (n_heads / n_kv);
     const float* qv = q + t * q_dim + h * head_dim;
-    int64_t len = pos0 + t + 1;  // causal: attend to positions [0, len)
+    const int32_t* table = tables + (int64_t)seq_ids[t] * mbps;
+    int64_t len = positions[t] + 1;  // causal: attend to positions [0, len)
 
     float sc[TE_ATTN_MAX_SEQ];
     float maxs = -1e30f;
     for (int64_t p = 0; p < len; p++) {
-        const float* kv_row = kcache + p * kv_dim + kvh * head_dim;
+        int64_t off = ((int64_t)table[p / block_size] * block_size + p % block_size) * kv_dim;
+        const float* kv_row = kpool + off + kvh * head_dim;
         float dot = 0.f;
         for (int64_t d = 0; d < head_dim; d++) dot += qv[d] * kv_row[d];
         sc[p] = dot * scale;
@@ -168,12 +189,22 @@ __global__ void attn_naive_kernel(float* out, const float* q,
     float acc[TE_ATTN_MAX_HEAD_DIM];
     for (int64_t d = 0; d < head_dim; d++) acc[d] = 0.f;
     for (int64_t p = 0; p < len; p++) {
-        const float* v_row = vcache + p * kv_dim + kvh * head_dim;
+        int64_t off = ((int64_t)table[p / block_size] * block_size + p % block_size) * kv_dim;
+        const float* v_row = vpool + off + kvh * head_dim;
         float wgt = sc[p] / sum;
         for (int64_t d = 0; d < head_dim; d++) acc[d] += wgt * v_row[d];
     }
     float* orow = out + t * q_dim + h * head_dim;
     for (int64_t d = 0; d < head_dim; d++) orow[d] = acc[d];
+}
+
+// Gather selected rows (each sequence's last token) before the LM head.
+__global__ void gather_rows_kernel(float* out, const float* in,
+                                   const int32_t* idx, int64_t hidden) {
+    int64_t r = blockIdx.x;
+    const float* src = in + (int64_t)idx[r] * hidden;
+    float* dst = out + r * hidden;
+    for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x) dst[i] = src[i];
 }
 
 __global__ void silu_mul_kernel(float* gate, const float* up, int64_t n) {
@@ -274,6 +305,8 @@ int te_model_create(const TeModelConfig* cfg) {
         TE_FAIL(TE_ERR_ARG, "n_heads %% n_kv_heads != 0");
     if (cfg->max_seq > TE_ATTN_MAX_SEQ || cfg->head_dim > TE_ATTN_MAX_HEAD_DIM)
         TE_FAIL(TE_ERR_ARG, "max_seq/head_dim exceed naive-attention limits");
+    if (cfg->kv_block_size <= 0 || cfg->kv_num_blocks <= 0)
+        TE_FAIL(TE_ERR_ARG, "kv_block_size/kv_num_blocks must be positive");
 
     Model* m = new Model();
     m->c = *cfg;
@@ -326,7 +359,8 @@ int te_model_finalize(void) {
         if ((rc = require(m, lname(l, "mlp.down_proj.weight"), c.hidden * c.intermediate, nullptr))) return rc;
     }
 
-    TE_CHECK(cudaMalloc(&m->kv, c.n_layers * 2 * c.max_seq * m->kv_dim * sizeof(float)));
+    TE_CHECK(cudaMalloc(&m->kv, c.n_layers * 2 * c.kv_num_blocks *
+                                    c.kv_block_size * m->kv_dim * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->x, c.max_seq * c.hidden * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->xn, c.max_seq * c.hidden * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->proj, c.max_seq * c.hidden * sizeof(float)));
@@ -337,18 +371,18 @@ int te_model_finalize(void) {
     TE_CHECK(cudaMalloc(&m->mlp_out, c.max_seq * c.hidden * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->ff_gate, c.max_seq * c.intermediate * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->ff_up, c.max_seq * c.intermediate * sizeof(float)));
-    TE_CHECK(cudaMalloc(&m->d_logits, c.vocab * sizeof(float)));
+    TE_CHECK(cudaMalloc(&m->d_last_hidden, TE_MAX_BATCH_SEQS * c.hidden * sizeof(float)));
+    TE_CHECK(cudaMalloc(&m->d_logits, TE_MAX_BATCH_SEQS * c.vocab * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->d_tokens, c.max_seq * sizeof(int32_t)));
+    TE_CHECK(cudaMalloc(&m->d_positions, c.max_seq * sizeof(int32_t)));
+    TE_CHECK(cudaMalloc(&m->d_seq_ids, c.max_seq * sizeof(int32_t)));
+    TE_CHECK(cudaMalloc(&m->d_last_idx, TE_MAX_BATCH_SEQS * sizeof(int32_t)));
+    m->tables_cap = TE_MAX_BATCH_SEQS *
+                    ((c.max_seq + c.kv_block_size - 1) / c.kv_block_size);
+    TE_CHECK(cudaMalloc(&m->d_tables, m->tables_cap * sizeof(int32_t)));
     TE_CHECK_CUBLAS(cublasCreate(&m->cublas));
 
     m->finalized = true;
-    m->kv_len = 0;
-    return 0;
-}
-
-int te_reset_kv(void) {
-    if (!g_model) TE_FAIL(TE_ERR_STATE, "no model");
-    g_model->kv_len = 0;
     return 0;
 }
 
@@ -384,24 +418,65 @@ int te_debug_read(int64_t idx, float* out, int64_t numel) {
     return 0;
 }
 
-int te_forward(const int32_t* tokens, int64_t n, int64_t pos,
-               float* logits_out) {
+int te_forward_batch(int64_t n_seqs, const int32_t* tokens,
+                     const int32_t* n_tokens, const int32_t* pos,
+                     const int32_t* block_tables, int64_t max_blocks_per_seq,
+                     float* logits_out) {
     Model* m = g_model;
     if (!m || !m->finalized) TE_FAIL(TE_ERR_STATE, "model not ready");
-    if (!tokens || n <= 0 || !logits_out) TE_FAIL(TE_ERR_ARG, "bad forward args");
-    if (pos != m->kv_len)
-        TE_FAIL(TE_ERR_ARG, "pos %lld != cached length %lld (missed reset?)",
-                (long long)pos, (long long)m->kv_len);
-    if (pos + n > m->c.max_seq)
-        TE_FAIL(TE_ERR_ARG, "pos+n %lld exceeds max_seq %lld",
-                (long long)(pos + n), (long long)m->c.max_seq);
+    if (n_seqs <= 0 || n_seqs > TE_MAX_BATCH_SEQS)
+        TE_FAIL(TE_ERR_ARG, "n_seqs %lld out of range", (long long)n_seqs);
+    if (!tokens || !n_tokens || !pos || !block_tables || !logits_out ||
+        max_blocks_per_seq <= 0)
+        TE_FAIL(TE_ERR_ARG, "bad forward args");
 
     const TeModelConfig& c = m->c;
-    const int64_t layer_stride = 2 * c.max_seq * m->kv_dim;
+    const int64_t bs = c.kv_block_size;
+    const int64_t pool_stride = c.kv_num_blocks * bs * m->kv_dim;
+
+    // Flatten per-sequence descriptors into per-token position/owner arrays
+    // and validate block tables cover every touched slot.
+    std::vector<int32_t> h_positions, h_seq_ids;
+    std::vector<int32_t> h_last_idx(n_seqs);
+    int64_t n = 0;
+    for (int64_t s = 0; s < n_seqs; s++) {
+        if (n_tokens[s] <= 0) TE_FAIL(TE_ERR_ARG, "seq %lld has no tokens", (long long)s);
+        int64_t end = (int64_t)pos[s] + n_tokens[s];
+        if (pos[s] < 0 || end > c.max_seq)
+            TE_FAIL(TE_ERR_ARG, "seq %lld range [%d,%lld) exceeds max_seq",
+                    (long long)s, pos[s], (long long)end);
+        int64_t need_blocks = (end + bs - 1) / bs;
+        if (need_blocks > max_blocks_per_seq)
+            TE_FAIL(TE_ERR_ARG, "seq %lld needs %lld blocks, table has %lld",
+                    (long long)s, (long long)need_blocks, (long long)max_blocks_per_seq);
+        for (int64_t b = 0; b < need_blocks; b++) {
+            int32_t phys = block_tables[s * max_blocks_per_seq + b];
+            if (phys < 0 || phys >= c.kv_num_blocks)
+                TE_FAIL(TE_ERR_ARG, "seq %lld block %lld: bad physical id %d",
+                        (long long)s, (long long)b, phys);
+        }
+        for (int64_t t = 0; t < n_tokens[s]; t++) {
+            h_positions.push_back((int32_t)(pos[s] + t));
+            h_seq_ids.push_back((int32_t)s);
+        }
+        n += n_tokens[s];
+        h_last_idx[s] = (int32_t)(n - 1);
+    }
+    if (n > c.max_seq)
+        TE_FAIL(TE_ERR_ARG, "batch has %lld tokens, scratch holds %lld",
+                (long long)n, (long long)c.max_seq);
+    if (n_seqs * max_blocks_per_seq > m->tables_cap)
+        TE_FAIL(TE_ERR_ARG, "block tables exceed staging capacity");
+
     m->dbg.clear();
     int rc;
 
-    TE_CHECK(cudaMemcpy(m->d_tokens, tokens, n * sizeof(int32_t),
+    TE_CHECK(cudaMemcpy(m->d_tokens, tokens, n * sizeof(int32_t), cudaMemcpyHostToDevice));
+    TE_CHECK(cudaMemcpy(m->d_positions, h_positions.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice));
+    TE_CHECK(cudaMemcpy(m->d_seq_ids, h_seq_ids.data(), n * sizeof(int32_t), cudaMemcpyHostToDevice));
+    TE_CHECK(cudaMemcpy(m->d_last_idx, h_last_idx.data(), n_seqs * sizeof(int32_t), cudaMemcpyHostToDevice));
+    TE_CHECK(cudaMemcpy(m->d_tables, block_tables,
+                        n_seqs * max_blocks_per_seq * sizeof(int32_t),
                         cudaMemcpyHostToDevice));
 
     const float* w_embed;
@@ -437,16 +512,19 @@ int te_forward(const int32_t* tokens, int64_t n, int64_t pos,
         if ((rc = gemm_rowmajor(m->cublas, w_q, m->xn, m->q, m->q_dim, n, c.hidden))) return rc;
         if ((rc = gemm_rowmajor(m->cublas, w_k, m->xn, m->k, m->kv_dim, n, c.hidden))) return rc;
         if ((rc = gemm_rowmajor(m->cublas, w_v, m->xn, m->v, m->kv_dim, n, c.hidden))) return rc;
-        rope_kernel<<<(int)n, kBlock>>>(m->q, c.n_heads, c.head_dim, pos, c.rope_theta);
-        rope_kernel<<<(int)n, kBlock>>>(m->k, c.n_kv_heads, c.head_dim, pos, c.rope_theta);
+        rope_kernel<<<(int)n, kBlock>>>(m->q, m->d_positions, c.n_heads, c.head_dim, c.rope_theta);
+        rope_kernel<<<(int)n, kBlock>>>(m->k, m->d_positions, c.n_kv_heads, c.head_dim, c.rope_theta);
 
-        float* kcache = m->kv + l * layer_stride;
-        float* vcache = kcache + c.max_seq * m->kv_dim;
-        kv_append_kernel<<<(int)n, kBlock>>>(kcache, vcache, m->k, m->v, pos, m->kv_dim);
+        float* kpool = m->kv + (l * 2 + 0) * pool_stride;
+        float* vpool = m->kv + (l * 2 + 1) * pool_stride;
+        kv_append_paged_kernel<<<(int)n, kBlock>>>(
+            kpool, vpool, m->k, m->v, m->d_positions, m->d_seq_ids,
+            m->d_tables, max_blocks_per_seq, bs, m->kv_dim);
 
         dim3 attn_grid((unsigned)n, (unsigned)c.n_heads);
-        attn_naive_kernel<<<attn_grid, 1>>>(
-            m->attn, m->q, kcache, vcache, pos, c.n_heads, c.n_kv_heads,
+        attn_paged_kernel<<<attn_grid, 1>>>(
+            m->attn, m->q, kpool, vpool, m->d_positions, m->d_seq_ids,
+            m->d_tables, max_blocks_per_seq, bs, c.n_heads, c.n_kv_heads,
             c.head_dim, m->kv_dim, 1.f / sqrtf((float)c.head_dim));
 
         if ((rc = gemm_rowmajor(m->cublas, w_o, m->attn, m->proj, c.hidden, n, m->q_dim))) return rc;
@@ -467,14 +545,16 @@ int te_forward(const int32_t* tokens, int64_t n, int64_t pos,
     if ((rc = debug_capture(m, m->x, n * c.hidden))) return rc;
     if ((rc = debug_capture(m, m->xn, n * c.hidden))) return rc;
 
-    // Logits for the last token only.
-    if ((rc = gemm_rowmajor(m->cublas, w_lm, m->xn + (n - 1) * c.hidden,
-                            m->d_logits, c.vocab, 1, c.hidden))) return rc;
+    // Logits for each sequence's last token only.
+    gather_rows_kernel<<<(int)n_seqs, kBlock>>>(m->d_last_hidden, m->xn,
+                                                m->d_last_idx, c.hidden);
+    if ((rc = gemm_rowmajor(m->cublas, w_lm, m->d_last_hidden, m->d_logits,
+                            c.vocab, n_seqs, c.hidden))) return rc;
 
     TE_CHECK(cudaGetLastError());
-    TE_CHECK(cudaMemcpy(logits_out, m->d_logits, c.vocab * sizeof(float),
+    TE_CHECK(cudaMemcpy(logits_out, m->d_logits,
+                        n_seqs * c.vocab * sizeof(float),
                         cudaMemcpyDeviceToHost));
-    m->kv_len = pos + n;
     return 0;
 }
 

@@ -27,8 +27,21 @@ type ModelConfig struct {
 	TopK            int64
 	MoeIntermediate int64
 	RouterMode      int64 // 0 = softmax top-k renorm, 1 = sigmoid + expert bias
-	RopeTheta       float64
-	RMSEps          float64
+	// Paged KV
+	KVBlockSize int64
+	KVNumBlocks int64
+	RopeTheta   float64
+	RMSEps      float64
+}
+
+// MaxBatchSeqs mirrors TE_MAX_BATCH_SEQS in shim.h.
+const MaxBatchSeqs = 128
+
+// SeqForward is one sequence's slice of a forward_step batch.
+type SeqForward struct {
+	Tokens     []int32 // new tokens (prefill: many, decode: one)
+	Pos        int     // absolute position of Tokens[0]
+	BlockTable []int32 // physical KV block ids covering Pos+len(Tokens)
 }
 
 // Handle is an initialized connection to the CUDA backend library.
@@ -45,8 +58,7 @@ type impl interface {
 	modelCreate(cfg *ModelConfig) error
 	loadTensor(name string, f32raw []byte) error
 	finalize() error
-	forward(tokens []int32, pos int, logits []float32) error
-	resetKV() error
+	forwardBatch(seqs []SeqForward, logits []float32) error
 	setFusion(on bool) error
 	debugSet(on bool) error
 	debugCount() (int, error)
@@ -97,21 +109,28 @@ func (h *Handle) LoadTensorF32(name string, f32raw []byte) error {
 // Finalize validates weight completeness and allocates KV + scratch.
 func (h *Handle) Finalize() error { return h.impl.finalize() }
 
-// Forward runs n tokens starting at absolute position pos and returns the
-// vocab-size logits for the last token.
-func (h *Handle) Forward(tokens []int32, pos int) ([]float32, error) {
-	if len(tokens) == 0 {
-		return nil, fmt.Errorf("forward: empty token slice")
+// ForwardBatch runs one forward step for a batch of sequences and returns
+// each sequence's last-token logits.
+func (h *Handle) ForwardBatch(seqs []SeqForward) ([][]float32, error) {
+	if len(seqs) == 0 || len(seqs) > MaxBatchSeqs {
+		return nil, fmt.Errorf("forward: batch of %d sequences (max %d)", len(seqs), MaxBatchSeqs)
 	}
-	logits := make([]float32, h.cfg.Vocab)
-	if err := h.impl.forward(tokens, pos, logits); err != nil {
+	for i, s := range seqs {
+		if len(s.Tokens) == 0 {
+			return nil, fmt.Errorf("forward: sequence %d has no tokens", i)
+		}
+	}
+	vocab := int(h.cfg.Vocab)
+	flat := make([]float32, len(seqs)*vocab)
+	if err := h.impl.forwardBatch(seqs, flat); err != nil {
 		return nil, err
 	}
-	return logits, nil
+	out := make([][]float32, len(seqs))
+	for i := range out {
+		out[i] = flat[i*vocab : (i+1)*vocab : (i+1)*vocab]
+	}
+	return out, nil
 }
-
-// ResetKV drops all cached KV (start a fresh sequence).
-func (h *Handle) ResetKV() error { return h.impl.resetKV() }
 
 // SetFusion toggles fused kernels (default on); the unfused path exists for
 // honest before/after benchmarking.

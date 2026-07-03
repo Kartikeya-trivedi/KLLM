@@ -107,6 +107,39 @@ Also fixed en route: shim return codes are C `int` (32-bit) — the Go side
 must truncate `uintptr` to `int32` before sign-reading or negative TE_ERR_*
 codes print as huge unsigned values.
 
+## Phase 2 — Paged KV — DONE
+
+Clean break at the boundary: single-sequence `te_forward` (backend-tracked
+position) replaced by a **stateless `te_forward_batch`** — per-sequence
+token spans, absolute positions, and block tables all supplied by Go. The
+backend holds only the physical pool
+(`[layers][2][num_blocks][block_size][kv_dim]`, one cudaMalloc); Go's
+`engine/kv` owns the free list and per-sequence tables (LIFO allocator,
+Reserve/Commit/Release). Attention and KV-append gather through the block
+table; RoPE takes a per-token position array (mixed prefill+decode batches
+have non-uniform positions).
+
+Division of labor that fell out nicely: **Go decides placement, CUDA never
+allocates per-sequence**; the backend validates every table slot it will
+touch before launching (bad physical ids fail fast at the boundary instead
+of corrupting the pool).
+
+Correctness gates:
+- `TestMatchesHFReference` re-passes through the paged path (both fusion
+  modes) — same 5x16 tokens, same tolerances.
+- New `TestPagedBatchMatchesSolo`: two prompts of different lengths run
+  jointly — one batched forward per step, shared pool, sequences retiring
+  as they finish (a small preview of continuous batching). Both streams
+  match HF token-for-token.
+
+Capacity math (the point of paging): contiguous KV needed
+`n_seqs x max_seq x layers x 2 x kv_dim` up front — at lab scale
+(max_seq 256) that is 1 MiB per sequence slot regardless of use; paged, a
+5-token prompt holds one 16-token block per layer-pair (~4 KiB) and the same
+pool serves however many sequences actually fit. At 30B scale (48 layers,
+kv_dim 1024, 4K context) contiguous is ~1.6 GiB per *slot* while paged
+fragmentation waste is bounded by block_size-1 tokens per sequence.
+
 ## Phase 0 — original goals
 
 Goal: Go greedy-decodes `testmodels/tiny-llama` (2-layer, hidden 64, GQA 4/2,
