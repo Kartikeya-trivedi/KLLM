@@ -31,6 +31,12 @@ def parse_args():
     p.add_argument("--prompts", required=True, help="text file, one prompt per line")
     p.add_argument("--out", required=True, help="output directory")
     p.add_argument("--max-new-tokens", type=int, default=32)
+    p.add_argument(
+        "--raw-ids",
+        action="store_true",
+        help="prompts file holds space-separated token ids per line (no tokenizer; "
+        "for tokenizer-less test models from make_test_model.py)",
+    )
     p.add_argument("--dtype", default="float32", choices=["float32", "bfloat16", "float16"])
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
@@ -42,7 +48,7 @@ def main():
     out_root = Path(args.out)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    tok = AutoTokenizer.from_pretrained(args.model)
+    tok = None if args.raw_ids else AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
     model.to(args.device).eval()
 
@@ -64,7 +70,11 @@ def main():
     for i, prompt in enumerate(prompts):
         pdir = out_root / f"prompt_{i}"
         pdir.mkdir(exist_ok=True)
-        input_ids = tok(prompt, return_tensors="pt").input_ids.to(args.device)
+        if args.raw_ids:
+            ids_list = [int(x) for x in prompt.split()]
+            input_ids = torch.tensor([ids_list], device=args.device)
+        else:
+            input_ids = tok(prompt, return_tensors="pt").input_ids.to(args.device)
 
         # --- Per-layer hidden states for the prompt (prefill) pass ---
         with torch.no_grad():
@@ -74,12 +84,12 @@ def main():
             np.save(pdir / f"layer_{j}.npy", hs[0].float().cpu().numpy())
 
         # --- Greedy decode, capturing final-position logits each step ---
-        ids = input_ids
+        eos_id = tok.eos_token_id if tok is not None else model.config.eos_token_id
         step_logits = []
         gen_ids = []
         with torch.no_grad():
             past = None
-            cur = ids
+            cur = input_ids
             for _ in range(args.max_new_tokens):
                 out = model(cur, past_key_values=past, use_cache=True)
                 past = out.past_key_values
@@ -87,22 +97,23 @@ def main():
                 step_logits.append(logits.float().cpu().numpy())
                 nxt = int(torch.argmax(logits))
                 gen_ids.append(nxt)
-                if nxt == tok.eos_token_id:
+                if eos_id is not None and nxt == eos_id:
                     break
                 cur = torch.tensor([[nxt]], device=args.device)
 
         np.save(pdir / "logits.npy", np.stack(step_logits))
+        gen_text = tok.decode(gen_ids) if tok is not None else ""
         (pdir / "tokens.json").write_text(
             json.dumps(
                 {
                     "prompt": prompt,
                     "input_ids": input_ids[0].tolist(),
                     "generated_ids": gen_ids,
-                    "generated_text": tok.decode(gen_ids),
+                    "generated_text": gen_text,
                 }
             )
         )
-        print(f"[{i}] {prompt!r} -> {tok.decode(gen_ids)!r}")
+        print(f"[{i}] {prompt!r} -> {gen_text!r} {gen_ids}")
 
     print(f"wrote {len(prompts)} reference dumps to {out_root}")
 
