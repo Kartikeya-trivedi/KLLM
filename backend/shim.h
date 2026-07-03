@@ -57,7 +57,15 @@ typedef struct TeModelConfig {
     // Paged KV
     int64_t kv_block_size;  // tokens per KV block (e.g. 16)
     int64_t kv_num_blocks;  // pool size; VRAM = layers*2*num_blocks*block*kv_dim*4B
-    double rope_theta;
+    // Architecture family
+    int64_t arch;             // 0 = llama (RMSNorm w, SiLU), 1 = gemma3
+                              //   (RMSNorm (1+w), embed*sqrt(hidden), GELU-tanh,
+                              //    qk-norm, sandwich norms)
+    int64_t sliding_window;   // >0: sliding-attention layers use this window
+    int64_t sliding_pattern;  // layer l is sliding iff (l+1) % pattern != 0
+    double rope_theta;        // full-attention (global) layers
+    double rope_local_theta;  // sliding layers (0 = same as rope_theta)
+    double query_scalar;      // attn scale = 1/sqrt(query_scalar); 0 = head_dim
     double rms_eps;
 } TeModelConfig;
 
@@ -82,6 +90,11 @@ TE_API int te_model_load_tensor_w4(const char* name, const uint8_t* q,
 // iteration to ms_out. Standalone (own allocations); requires te_init only.
 TE_API int te_bench_matmul(int64_t m, int64_t k, int64_t n, int64_t iters,
                            int64_t mode, double* ms_out);
+
+// Optional, before finalize: explicit per-layer sliding flags (1 = sliding,
+// 0 = full attention), length n_layers. Overrides the (l+1)%pattern formula —
+// authoritative when the checkpoint ships layer_types.
+TE_API int te_model_set_layer_sliding(const int32_t* sliding, int64_t n);
 
 // Validate that every weight the config requires has arrived; allocate KV
 // cache and scratch. After this the model is immutable and ready to run.
