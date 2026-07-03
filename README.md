@@ -76,6 +76,9 @@ tabs generating at once are merged into one GPU batch by the scheduler.
 
 Requirements: CUDA Toolkit 12.x, Visual Studio 2022 with the C++ workload
 (nvcc uses cl.exe as host compiler on Windows), Go 1.26+, an NVIDIA GPU.
+**Full instructions — including Linux, Modal, real-model conversion, and a
+troubleshooting table of every issue this repo actually hit — are in
+[docs/SETUP.md](docs/SETUP.md).** The short version:
 
 ```powershell
 # 1. Build the CUDA backend (locates MSVC via vswhere automatically)
