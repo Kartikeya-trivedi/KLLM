@@ -36,11 +36,13 @@ struct Model {
 
     // Scratch, sized for max_seq tokens in flight.
     float *x = nullptr, *xn = nullptr, *q = nullptr, *k = nullptr, *v = nullptr;
-    float *attn = nullptr, *proj = nullptr, *ff_gate = nullptr, *ff_up = nullptr;
+    float *attn = nullptr, *proj = nullptr, *mlp_out = nullptr;
+    float *ff_gate = nullptr, *ff_up = nullptr;
     float* d_logits = nullptr;
     int32_t* d_tokens = nullptr;
 
     cublasHandle_t cublas = nullptr;
+    bool fused = true;  // te_set_fusion
 
     bool debug = false;
     std::vector<std::vector<float>> dbg;  // host copies of residual stream
@@ -78,6 +80,32 @@ __global__ void rmsnorm_kernel(float* out, const float* in, const float* w,
     float scale = rsqrtf(sh[0] / (float)hidden + eps);
     for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x)
         orow[i] = row[i] * scale * w[i];
+}
+
+// Phase 1 fusion: x += res, then out = rmsnorm(x) * w, one pass instead of
+// an add kernel plus a norm kernel (saves one full read+write of the
+// residual stream per site). One block per token.
+__global__ void add_rmsnorm_kernel(float* x, const float* res, float* out,
+                                   const float* w, int64_t hidden, float eps) {
+    extern __shared__ float sh[];
+    float* xrow = x + (int64_t)blockIdx.x * hidden;
+    const float* rrow = res + (int64_t)blockIdx.x * hidden;
+    float* orow = out + (int64_t)blockIdx.x * hidden;
+    float ss = 0.f;
+    for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float v = xrow[i] + rrow[i];
+        xrow[i] = v;
+        ss += v * v;
+    }
+    sh[threadIdx.x] = ss;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sh[threadIdx.x] += sh[threadIdx.x + s];
+        __syncthreads();
+    }
+    float scale = rsqrtf(sh[0] / (float)hidden + eps);
+    for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x)
+        orow[i] = xrow[i] * scale * w[i];
 }
 
 // HF Llama RoPE (rotate_half): pairs (j, j+d/2) share inv_freq[j].
@@ -212,6 +240,20 @@ int grid_for(int64_t n) {
     return (int)(g > 4096 ? 4096 : g);
 }
 
+// x += res, then xn = rmsnorm(x, w). Fused (1 kernel) or unfused (2), per
+// the te_set_fusion toggle — identical math either way.
+void add_norm(Model* m, int64_t n, float* res, const float* w) {
+    const TeModelConfig& c = m->c;
+    if (m->fused) {
+        add_rmsnorm_kernel<<<(int)n, kBlock, kBlock * sizeof(float)>>>(
+            m->x, res, m->xn, w, c.hidden, (float)c.rms_eps);
+    } else {
+        add_inplace_kernel<<<grid_for(n * c.hidden), kBlock>>>(m->x, res, n * c.hidden);
+        rmsnorm_kernel<<<(int)n, kBlock, kBlock * sizeof(float)>>>(
+            m->xn, m->x, w, c.hidden, (float)c.rms_eps);
+    }
+}
+
 }  // namespace
 
 // ---- C-ABI ------------------------------------------------------------------
@@ -292,6 +334,7 @@ int te_model_finalize(void) {
     TE_CHECK(cudaMalloc(&m->k, c.max_seq * m->kv_dim * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->v, c.max_seq * m->kv_dim * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->attn, c.max_seq * m->q_dim * sizeof(float)));
+    TE_CHECK(cudaMalloc(&m->mlp_out, c.max_seq * c.hidden * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->ff_gate, c.max_seq * c.intermediate * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->ff_up, c.max_seq * c.intermediate * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->d_logits, c.vocab * sizeof(float)));
@@ -306,6 +349,12 @@ int te_model_finalize(void) {
 int te_reset_kv(void) {
     if (!g_model) TE_FAIL(TE_ERR_STATE, "no model");
     g_model->kv_len = 0;
+    return 0;
+}
+
+int te_set_fusion(int64_t enabled) {
+    if (!g_model) TE_FAIL(TE_ERR_STATE, "no model");
+    g_model->fused = enabled != 0;
     return 0;
 }
 
@@ -360,6 +409,11 @@ int te_forward(const int32_t* tokens, int64_t n, int64_t pos,
     embed_gather_kernel<<<(int)n, kBlock>>>(m->x, w_embed, m->d_tokens, c.hidden);
     if ((rc = debug_capture(m, m->x, n * c.hidden))) return rc;
 
+    // The residual add is deferred and fused into the NEXT norm: layer l's
+    // MLP output is added to x at the top of layer l+1 (or at the final
+    // norm). Debug captures move with it, preserving HF hidden_states order.
+    float* pending = nullptr;
+
     for (int64_t l = 0; l < c.n_layers; l++) {
         const float *w_in_ln, *w_post_ln, *w_q, *w_k, *w_v, *w_o, *w_gate, *w_up, *w_down;
         if ((rc = require(m, lname(l, "input_layernorm.weight"), c.hidden, &w_in_ln))) return rc;
@@ -373,8 +427,13 @@ int te_forward(const int32_t* tokens, int64_t n, int64_t pos,
         if ((rc = require(m, lname(l, "mlp.down_proj.weight"), c.hidden * c.intermediate, &w_down))) return rc;
 
         // Attention block
-        rmsnorm_kernel<<<(int)n, kBlock, kBlock * sizeof(float)>>>(
-            m->xn, m->x, w_in_ln, c.hidden, (float)c.rms_eps);
+        if (pending) {
+            add_norm(m, n, pending, w_in_ln);  // x += prev MLP out; xn = norm(x)
+            if ((rc = debug_capture(m, m->x, n * c.hidden))) return rc;  // out of layer l-1
+        } else {
+            rmsnorm_kernel<<<(int)n, kBlock, kBlock * sizeof(float)>>>(
+                m->xn, m->x, w_in_ln, c.hidden, (float)c.rms_eps);
+        }
         if ((rc = gemm_rowmajor(m->cublas, w_q, m->xn, m->q, m->q_dim, n, c.hidden))) return rc;
         if ((rc = gemm_rowmajor(m->cublas, w_k, m->xn, m->k, m->kv_dim, n, c.hidden))) return rc;
         if ((rc = gemm_rowmajor(m->cublas, w_v, m->xn, m->v, m->kv_dim, n, c.hidden))) return rc;
@@ -391,25 +450,21 @@ int te_forward(const int32_t* tokens, int64_t n, int64_t pos,
             c.head_dim, m->kv_dim, 1.f / sqrtf((float)c.head_dim));
 
         if ((rc = gemm_rowmajor(m->cublas, w_o, m->attn, m->proj, c.hidden, n, m->q_dim))) return rc;
-        add_inplace_kernel<<<grid_for(n * c.hidden), kBlock>>>(m->x, m->proj, n * c.hidden);
+        add_norm(m, n, m->proj, w_post_ln);  // x += attn proj; xn = norm(x)
 
-        // MLP block
-        rmsnorm_kernel<<<(int)n, kBlock, kBlock * sizeof(float)>>>(
-            m->xn, m->x, w_post_ln, c.hidden, (float)c.rms_eps);
+        // MLP block (output deferred into the next norm via `pending`)
         if ((rc = gemm_rowmajor(m->cublas, w_gate, m->xn, m->ff_gate, c.intermediate, n, c.hidden))) return rc;
         if ((rc = gemm_rowmajor(m->cublas, w_up, m->xn, m->ff_up, c.intermediate, n, c.hidden))) return rc;
         silu_mul_kernel<<<grid_for(n * c.intermediate), kBlock>>>(m->ff_gate, m->ff_up, n * c.intermediate);
-        if ((rc = gemm_rowmajor(m->cublas, w_down, m->ff_gate, m->proj, c.hidden, n, c.intermediate))) return rc;
-        add_inplace_kernel<<<grid_for(n * c.hidden), kBlock>>>(m->x, m->proj, n * c.hidden);
-
-        if ((rc = debug_capture(m, m->x, n * c.hidden))) return rc;
+        if ((rc = gemm_rowmajor(m->cublas, w_down, m->ff_gate, m->mlp_out, c.hidden, n, c.intermediate))) return rc;
+        pending = m->mlp_out;
     }
 
     const float *w_norm, *w_lm;
     if ((rc = require(m, "model.norm.weight", c.hidden, &w_norm))) return rc;
     if ((rc = require(m, "lm_head.weight", c.vocab * c.hidden, &w_lm))) return rc;
-    rmsnorm_kernel<<<(int)n, kBlock, kBlock * sizeof(float)>>>(
-        m->xn, m->x, w_norm, c.hidden, (float)c.rms_eps);
+    add_norm(m, n, pending, w_norm);  // x = last layer's output; xn = final norm
+    if ((rc = debug_capture(m, m->x, n * c.hidden))) return rc;
     if ((rc = debug_capture(m, m->xn, n * c.hidden))) return rc;
 
     // Logits for the last token only.

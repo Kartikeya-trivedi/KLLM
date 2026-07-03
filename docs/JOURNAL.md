@@ -69,7 +69,45 @@ the classic divergence sources, each pinned down before running):
 The correctness harness is now the regression net for every later phase:
 any kernel change that breaks numerics fails `engine/e2e` immediately.
 
-### Phase 0 — original goals
+## Phase 1 — First fused kernel + metrics + roofline — DONE
+
+Built `add_rmsnorm_kernel` (residual add fused into the next RMSNorm) with a
+runtime toggle (`te_set_fusion`) so fused/unfused A/B runs in one binary, and
+`cmd/bench` for TTFT/ITL/tok-s. The forward loop now defers each MLP
+residual add into the next norm (`pending` pointer), halving norm-site
+kernel launches; debug captures moved with it so the HF per-layer diff still
+passes bit-for-bit semantics. **e2e suite validates both paths** (fused=true
+and fused=false subtests) — the fusion is proven equal, not assumed.
+
+Measured (GTX 1650, tiny 2-layer model, prompt 32, 256 decode steps,
+interleaved best-of-8, aggregate-timed):
+
+| config  | ITL avg | decode tok/s |
+|---------|---------|--------------|
+| unfused | ~570 µs | ~1750        |
+| fused   | ~545 µs | ~1830        |
+
+**Roofline position (the actual lesson):** the tiny model moves ~0.56 MB of
+weights per decode token; at the 1650's ~192 GB/s that is ~3 µs of traffic —
+under 1% of the ~550 µs measured ITL. This workload is **launch/overhead
+bound, nowhere near the bandwidth roof**: ~30 kernel+GEMM launches per step
+at ~10-20 µs each (Windows WDDM submission makes launches especially
+expensive) accounts for essentially the whole ITL. Fusion removed 5
+launches/step → the observed ~3-5%. Consequences recorded for later phases:
+(a) at 30B/48-layer scale, decode becomes truly bandwidth-bound (~15 GB of
+W4 weights/token ≈ 20 ms at A6000's 768 GB/s) and fusion/quantization pay
+proportionally; (b) the real per-launch fix is CUDA graphs (planned at the
+boundary since day one); (c) per-sample Windows timing quantizes at ~0.5 ms
+— bench measures in aggregate and divides.
+
+Tooling note: Nsight Compute (`ncu` 2025.1) is installed on this box —
+reserved for the kernel-optimization endgame; Nsight Systems is not.
+
+Also fixed en route: shim return codes are C `int` (32-bit) — the Go side
+must truncate `uintptr` to `int32` before sign-reading or negative TE_ERR_*
+codes print as huge unsigned values.
+
+## Phase 0 — original goals
 
 Goal: Go greedy-decodes `testmodels/tiny-llama` (2-layer, hidden 64, GQA 4/2,
 vocab 512, ~140K params, seeded random weights, HF-loadable) and matches

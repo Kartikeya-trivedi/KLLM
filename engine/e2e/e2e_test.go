@@ -60,6 +60,16 @@ func TestMatchesHFReference(t *testing.T) {
 	defer e.Close()
 	L := int(e.Cfg.NumHiddenLayers)
 
+	// Both kernel paths must match the oracle: fused (default) and unfused.
+	for _, fused := range []bool{true, false} {
+		if err := e.B.SetFusion(fused); err != nil {
+			t.Fatal(err)
+		}
+		t.Run(fmt.Sprintf("fused=%v", fused), func(t *testing.T) { runPrompts(t, e, dumps, man, L) })
+	}
+}
+
+func runPrompts(t *testing.T, e *engine.Engine, dumps string, man manifest, L int) {
 	for i := range man.Prompts {
 		pdir := filepath.Join(dumps, fmt.Sprintf("prompt_%d", i))
 		t.Run(fmt.Sprintf("prompt_%d", i), func(t *testing.T) {
