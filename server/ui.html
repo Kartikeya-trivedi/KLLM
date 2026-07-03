@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kllm — inference playground</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d;
+    --fg: #e6edf3; --muted: #8b949e; --accent: #2f81f7; --accent2: #3fb950;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    padding: 20px 24px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  }
+  header h1 { margin: 0; font-size: 18px; letter-spacing: .3px; }
+  header .tag { color: var(--muted); font-size: 13px; }
+  header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  header .dot.up { background: var(--accent2); }
+  main { max-width: 900px; margin: 0 auto; padding: 24px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px; margin-bottom: 18px;
+  }
+  label { display: block; color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+  textarea, input[type=number] {
+    width: 100%; background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+    font-family: var(--mono); font-size: 14px;
+  }
+  textarea { resize: vertical; min-height: 64px; }
+  .row { display: flex; gap: 14px; flex-wrap: wrap; align-items: end; margin-top: 14px; }
+  .row > div { flex: 1; min-width: 120px; }
+  button {
+    background: var(--accent); color: white; border: 0; border-radius: 8px;
+    padding: 10px 18px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--fg); }
+  button:disabled { opacity: .5; cursor: default; }
+  .out {
+    font-family: var(--mono); font-size: 14px; white-space: pre-wrap;
+    word-break: break-word; min-height: 48px; line-height: 1.7;
+  }
+  .tok { color: var(--accent2); }
+  .stats { display: flex; gap: 22px; color: var(--muted); font-size: 13px; margin-top: 12px; flex-wrap: wrap; }
+  .stats b { color: var(--fg); font-variant-numeric: tabular-nums; }
+  .note { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+  a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>kllm</h1>
+  <span class="tag">Go + CUDA inference engine · token-stream playground</span>
+  <span style="margin-left:auto" class="tag"><span id="dot" class="dot"></span> <span id="health">checking…</span></span>
+</header>
+
+<main>
+  <div class="card">
+    <label for="ids">Prompt token IDs <span class="note">(space/comma separated — this build has no tokenizer; it decodes raw IDs)</span></label>
+    <textarea id="ids">1 17 42 100 7</textarea>
+    <div class="row">
+      <div>
+        <label for="steps">Max new tokens</label>
+        <input id="steps" type="number" value="32" min="1" max="1024">
+      </div>
+      <div style="flex:0 0 auto; display:flex; gap:10px;">
+        <button id="go">Generate ▸</button>
+        <button id="rand" class="ghost">Random prompt</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>Streamed output</label>
+    <div id="out" class="out"><span class="note">tokens appear here as the server streams them over SSE…</span></div>
+    <div class="stats">
+      <span>tokens <b id="n">0</b></span>
+      <span>TTFT <b id="ttft">—</b></span>
+      <span>tok/s <b id="tps">—</b></span>
+    </div>
+  </div>
+
+  <p class="note">
+    Each token is one <code>data: {"token":N}</code> Server-Sent Event from
+    <code>POST /v1/generate</code>. Multiple browser tabs generating at once are
+    merged into one GPU batch by the continuous-batching scheduler.
+    See <a href="https://github.com/Kartikeya-trivedi/kllm" id="repo">the repo</a> ·
+    <code>docs/THEORY.md</code> for how it works.
+  </p>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+
+async function health() {
+  try {
+    const r = await fetch("healthz");
+    if (r.ok) { $("dot").classList.add("up"); $("health").textContent = "engine up"; return; }
+  } catch (e) {}
+  $("dot").classList.remove("up"); $("health").textContent = "engine down";
+}
+health(); setInterval(health, 4000);
+
+$("rand").onclick = () => {
+  const n = 4 + Math.floor(Math.random() * 12);
+  const ids = Array.from({length: n}, () => Math.floor(Math.random() * 512));
+  $("ids").value = ids.join(" ");
+};
+
+$("go").onclick = async () => {
+  const ids = $("ids").value.split(/[\s,]+/).filter(Boolean).map(Number);
+  if (ids.some(isNaN) || ids.length === 0) { alert("enter integer token ids"); return; }
+  const steps = Math.max(1, parseInt($("steps").value) || 32);
+
+  $("go").disabled = true;
+  $("out").innerHTML = "";
+  $("n").textContent = "0"; $("ttft").textContent = "—"; $("tps").textContent = "—";
+
+  const t0 = performance.now();
+  let count = 0, ttft = 0;
+  try {
+    const resp = await fetch("v1/generate", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ ids, max_new_tokens: steps })
+    });
+    if (!resp.ok) { $("out").textContent = "error: " + resp.status + " " + (await resp.text()); return; }
+
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const frame = buf.slice(0, idx).trim(); buf = buf.slice(idx + 2);
+        if (!frame.startsWith("data:")) continue;
+        const payload = frame.slice(5).trim();
+        if (payload === "[DONE]") continue;
+        const obj = JSON.parse(payload);
+        if (obj.error) { $("out").innerHTML += `<span style="color:#f85149">⚠ ${obj.error}</span>`; continue; }
+        if (count === 0) { ttft = performance.now() - t0; $("ttft").textContent = ttft.toFixed(0) + " ms"; }
+        count++;
+        const span = document.createElement("span");
+        span.className = "tok"; span.textContent = obj.token + " ";
+        $("out").appendChild(span);
+        $("n").textContent = count;
+        const dt = (performance.now() - t0) / 1000;
+        $("tps").textContent = (count / dt).toFixed(1);
+      }
+    }
+  } catch (e) {
+    $("out").innerHTML += `<span style="color:#f85149">⚠ ${e.message}</span>`;
+  } finally {
+    $("go").disabled = false;
+  }
+};
+</script>
+</body>
+</html>

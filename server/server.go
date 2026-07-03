@@ -1,13 +1,18 @@
-// Package server exposes the scheduler over HTTP with SSE token streaming.
+// Package server exposes the scheduler over HTTP with SSE token streaming
+// plus a small browser playground at /.
 package server
 
 import (
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
 
 	"kllm/engine"
 )
+
+//go:embed ui.html
+var uiHTML []byte
 
 type GenerateRequest struct {
 	IDs          []int32 `json:"ids"`
@@ -27,6 +32,16 @@ func Handler(s *engine.Scheduler) http.Handler {
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "ok")
+	})
+
+	// Browser playground (embedded; no external assets).
+	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(uiHTML)
 	})
 
 	// POST /v1/generate — SSE stream: one `data: {"token":N}` per token,

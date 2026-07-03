@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "kllm-serve",
+      "runtimeExecutable": "go",
+      "runtimeArgs": ["run", "./cmd/serve", "--addr", "127.0.0.1:8188", "--max-batch", "16", "--max-seq", "256", "--kv-blocks", "2048"],
+      "port": 8188
+    }
+  ]
+}
