@@ -140,6 +140,45 @@ pool serves however many sequences actually fit. At 30B scale (48 layers,
 kv_dim 1024, 4K context) contiguous is ~1.6 GiB per *slot* while paged
 fragmentation waste is bounded by block_size-1 tokens per sequence.
 
+## Phase 3 — Scheduler + continuous batching + HTTP/SSE — DONE
+
+Go's payoff phase. One batching goroutine owns the GPU; requests arrive on a
+channel, get admitted into free batch slots, and every step's batch is
+formed fresh: prompts (prefill) for new sequences, one token for running
+ones, sequences retiring at EOS/max-tokens and freeing their KV blocks
+immediately. Two admission constraints enforced per step: batch slots
+(`max-batch`) and the backend's **per-step token budget** (scratch size) —
+prefills that don't fit wait; decodes never starve (1 token each, budget ≥
+batch size). `server` wraps it in `POST /v1/generate` (SSE token stream) +
+`/healthz`; `cmd/loadgen` drives it with mixed-length concurrent requests.
+
+Found by the load generator, fixed, lesson recorded: the first scheduler
+capped *sequences* per batch but not *tokens* — 32 concurrent prefills
+overflowed the 256-token scratch. Continuous batching must budget both
+dimensions (vLLM's `max_num_batched_tokens` exists for exactly this reason).
+Also: Windows reserves port 8080 (WinNAT excluded range) — bind errors, not
+firewall prompts; the server defaults are fine, the demo runs on 8177.
+
+Correctness gate: `TestSchedulerMatchesHF` — all 5 reference prompts
+submitted concurrently through the scheduler (max batch 4 < 5, so queueing +
+mixed prefill/decode batches are exercised) reproduce HF's tokens exactly.
+
+Throughput (tiny model, GTX 1650, 64 requests/level, 32 new tokens each,
+prompts 4-48 tokens, HTTP end-to-end):
+
+| conc | req/s | tok/s  | TTFT p50 | TTFT p99 | total p99 |
+|------|-------|--------|----------|----------|-----------|
+| 1    | 36    | 1,106  | 2.4 ms   | 7.0 ms   | 59 ms     |
+| 4    | 178   | 5,518  | 2.2 ms   | 2.9 ms   | 28 ms     |
+| 16   | 540   | 16,978 | 2.7 ms   | 3.8 ms   | 35 ms     |
+| 32   | 741   | 22,833 | 5.1 ms   | 11.3 ms  | 43 ms     |
+| 64   | 742   | 23,147 | 18.2 ms  | 51.7 ms  | 85 ms     |
+
+20x throughput from batching before the curve flattens at the max-batch cap
+(32) — beyond it only queueing latency grows. Exactly the shape continuous
+batching should produce: the GPU step cost is near-flat in batch size at
+this scale (launch-bound), so batching is almost free throughput.
+
 ## Phase 0 — original goals
 
 Goal: Go greedy-decodes `testmodels/tiny-llama` (2-layer, hidden 64, GQA 4/2,
