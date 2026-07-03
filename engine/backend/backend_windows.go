@@ -17,6 +17,15 @@ type winImpl struct {
 	procInit           *syscall.Proc
 	procDeviceInfo     *syscall.Proc
 	procSmokeVectorAdd *syscall.Proc
+	procModelCreate    *syscall.Proc
+	procLoadTensor     *syscall.Proc
+	procFinalize       *syscall.Proc
+	procForward        *syscall.Proc
+	procResetKV        *syscall.Proc
+	procDebugSet       *syscall.Proc
+	procDebugCount     *syscall.Proc
+	procDebugSize      *syscall.Proc
+	procDebugRead      *syscall.Proc
 }
 
 func load(path string) (impl, error) {
@@ -37,6 +46,15 @@ func load(path string) (impl, error) {
 		{"te_init", &w.procInit},
 		{"te_device_info", &w.procDeviceInfo},
 		{"te_smoke_vector_add", &w.procSmokeVectorAdd},
+		{"te_model_create", &w.procModelCreate},
+		{"te_model_load_tensor", &w.procLoadTensor},
+		{"te_model_finalize", &w.procFinalize},
+		{"te_forward", &w.procForward},
+		{"te_reset_kv", &w.procResetKV},
+		{"te_debug_set", &w.procDebugSet},
+		{"te_debug_count", &w.procDebugCount},
+		{"te_debug_size", &w.procDebugSize},
+		{"te_debug_read", &w.procDebugRead},
 	} {
 		proc, err := dll.FindProc(p.name)
 		if err != nil {
@@ -48,14 +66,87 @@ func load(path string) (impl, error) {
 	return w, nil
 }
 
-// check converts a shim return code into a Go error using te_last_error.
+// check converts a shim return code (signed; negative = TE_ERR_*) into a Go
+// error using te_last_error.
 func (w *winImpl) check(fn string, rc uintptr) error {
-	if rc == 0 {
+	code := int64(rc)
+	if code == 0 {
 		return nil
 	}
 	buf := make([]byte, 512)
 	w.procLastError.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
-	return fmt.Errorf("%s: cuda error %d: %s", fn, rc, string(buf[:cstrlen(buf)]))
+	return fmt.Errorf("%s: backend error %d: %s", fn, code, string(buf[:cstrlen(buf)]))
+}
+
+func (w *winImpl) modelCreate(cfg *ModelConfig) error {
+	rc, _, _ := w.procModelCreate.Call(uintptr(unsafe.Pointer(cfg)))
+	return w.check("te_model_create", rc)
+}
+
+func (w *winImpl) loadTensor(name string, f32raw []byte) error {
+	cname := append([]byte(name), 0)
+	rc, _, _ := w.procLoadTensor.Call(
+		uintptr(unsafe.Pointer(&cname[0])),
+		uintptr(unsafe.Pointer(&f32raw[0])),
+		uintptr(len(f32raw)/4),
+	)
+	return w.check("te_model_load_tensor", rc)
+}
+
+func (w *winImpl) finalize() error {
+	rc, _, _ := w.procFinalize.Call()
+	return w.check("te_model_finalize", rc)
+}
+
+func (w *winImpl) forward(tokens []int32, pos int, logits []float32) error {
+	rc, _, _ := w.procForward.Call(
+		uintptr(unsafe.Pointer(&tokens[0])),
+		uintptr(len(tokens)),
+		uintptr(pos),
+		uintptr(unsafe.Pointer(&logits[0])),
+	)
+	return w.check("te_forward", rc)
+}
+
+func (w *winImpl) resetKV() error {
+	rc, _, _ := w.procResetKV.Call()
+	return w.check("te_reset_kv", rc)
+}
+
+func (w *winImpl) debugSet(on bool) error {
+	v := uintptr(0)
+	if on {
+		v = 1
+	}
+	rc, _, _ := w.procDebugSet.Call(v)
+	return w.check("te_debug_set", rc)
+}
+
+func (w *winImpl) debugCount() (int, error) {
+	rc, _, _ := w.procDebugCount.Call()
+	n := int64(rc)
+	if n < 0 {
+		return 0, fmt.Errorf("te_debug_count: %d (no model?)", n)
+	}
+	return int(n), nil
+}
+
+func (w *winImpl) debugRead(idx int) ([]float32, error) {
+	szRc, _, _ := w.procDebugSize.Call(uintptr(idx))
+	size := int64(szRc)
+	if size < 0 {
+		return nil, fmt.Errorf("te_debug_size(%d): %d", idx, size)
+	}
+	out := make([]float32, size)
+	rc, _, _ := w.procDebugRead.Call(
+		uintptr(idx),
+		uintptr(unsafe.Pointer(&out[0])),
+		uintptr(size),
+	)
+	if err := w.check("te_debug_read", rc); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (w *winImpl) init(device int) error {

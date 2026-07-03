@@ -1,26 +1,18 @@
 #define TE_BUILD_DLL
 #include "shim.h"
+#include "common.h"
 
 #include <cuda_runtime.h>
 #include <cstdio>
 
-// Per-thread last-error message so concurrent Go callers don't clobber each other.
-static thread_local char g_last_error[512] = "";
-
-#define TE_CHECK(call)                                                        \
-    do {                                                                      \
-        cudaError_t err_ = (call);                                            \
-        if (err_ != cudaSuccess) {                                            \
-            snprintf(g_last_error, sizeof(g_last_error), "%s:%d: %s: %s",     \
-                     __FILE__, __LINE__, #call, cudaGetErrorString(err_));    \
-            return (int)err_;                                                 \
-        }                                                                     \
-    } while (0)
+// Per-thread last-error message so concurrent Go callers don't clobber each
+// other. Shared by every backend translation unit via common.h.
+thread_local char g_te_last_error[512] = "";
 
 extern "C" {
 
 int te_last_error(char* buf, int buf_len) {
-    snprintf(buf, buf_len, "%s", g_last_error);
+    snprintf(buf, buf_len, "%s", g_te_last_error);
     return 0;
 }
 

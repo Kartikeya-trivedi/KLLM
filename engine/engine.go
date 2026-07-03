@@ -1,0 +1,105 @@
+// Package engine ties the pieces together: load a checkpoint through the
+// backend and run greedy decode.
+package engine
+
+import (
+	"fmt"
+
+	"kllm/engine/backend"
+	"kllm/engine/loader"
+	"kllm/models"
+)
+
+type Engine struct {
+	B   *backend.Handle
+	Cfg *models.HFConfig
+}
+
+// New loads the backend library, creates the model from modelDir
+// (config.json + safetensors), uploads all weights, and finalizes.
+func New(dllPath, modelDir string, device int, maxSeq int64) (*Engine, error) {
+	cfg, err := models.LoadConfig(modelDir)
+	if err != nil {
+		return nil, err
+	}
+	h, err := backend.Load(dllPath, device)
+	if err != nil {
+		return nil, err
+	}
+	if err := h.ModelCreate(cfg.Backend(maxSeq)); err != nil {
+		h.Close()
+		return nil, err
+	}
+
+	m, err := loader.OpenModel(modelDir)
+	if err != nil {
+		h.Close()
+		return nil, err
+	}
+	defer m.Close()
+	for _, t := range m.Tensors() {
+		if t.Dtype != loader.F32 {
+			h.Close()
+			return nil, fmt.Errorf("tensor %s is %s; only F32 checkpoints supported so far", t.Name, t.Dtype)
+		}
+		raw, err := m.ReadTensor(t.Name)
+		if err != nil {
+			h.Close()
+			return nil, err
+		}
+		if err := h.LoadTensorF32(t.Name, raw); err != nil {
+			h.Close()
+			return nil, fmt.Errorf("uploading %s: %w", t.Name, err)
+		}
+	}
+	if err := h.Finalize(); err != nil {
+		h.Close()
+		return nil, err
+	}
+	return &Engine{B: h, Cfg: cfg}, nil
+}
+
+// Prefill resets the KV cache and runs the prompt; returns last-token logits.
+func (e *Engine) Prefill(prompt []int32) ([]float32, error) {
+	if err := e.B.ResetKV(); err != nil {
+		return nil, err
+	}
+	return e.B.Forward(prompt, 0)
+}
+
+// Generate greedy-decodes up to maxNewTokens after the prompt, stopping at
+// the model's EOS id (if it has one).
+func (e *Engine) Generate(prompt []int32, maxNewTokens int) ([]int32, error) {
+	logits, err := e.Prefill(prompt)
+	if err != nil {
+		return nil, err
+	}
+	pos := len(prompt)
+	var out []int32
+	for range maxNewTokens {
+		next := Argmax(logits)
+		out = append(out, next)
+		if e.Cfg.EOSTokenID >= 0 && int64(next) == e.Cfg.EOSTokenID {
+			break
+		}
+		logits, err = e.B.Forward([]int32{next}, pos)
+		if err != nil {
+			return out, err
+		}
+		pos++
+	}
+	return out, nil
+}
+
+// Argmax returns the index of the largest logit (greedy sampling).
+func Argmax(logits []float32) int32 {
+	best, bestVal := 0, logits[0]
+	for i, v := range logits[1:] {
+		if v > bestVal {
+			best, bestVal = i+1, v
+		}
+	}
+	return int32(best)
+}
+
+func (e *Engine) Close() error { return e.B.Close() }
