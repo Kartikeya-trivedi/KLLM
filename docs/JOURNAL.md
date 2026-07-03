@@ -315,6 +315,48 @@ metrics (Go-native) + W&B via the Python tools for experiment tracking**
 (the official SDK), which is also where the rest of the offline tooling
 already lives.
 
+## Real model on a single A100 (Modal) — DONE
+
+First run of the engine on a **real** model and a **datacenter GPU**, not the
+toy: `modal run tools/modal_lab.py::bench_model` on a single **A100-SXM4-40GB
+(sm_80, 108 SMs)**. Pipeline: download **TinyLlama-1.1B-Chat** → convert
+bf16→fp32 in the engine's layout (`tools/convert_hf.py`, 1.10B params, 201
+tensors) → build backend `-arch=sm_80` → validate vs HuggingFace → benchmark.
+
+TinyLlama was chosen because the engine implements *plain* Llama (RMSNorm,
+rotate_half RoPE, SiLU-gated MLP, GQA, no attention bias, no qk-norm) and
+TinyLlama matches that exactly — same tensor names, no bias. The converter
+refuses archs that need kernel changes (Gemma embedding-scale/softcap/qk-norm,
+Qwen QKV-bias) with a clear error rather than emitting silent garbage.
+
+Results:
+- **Correctness: 16/16 greedy tokens identical to HuggingFace** on the real
+  1.1B model. The oracle isn't just for the toy — the engine is provably
+  right on a real checkpoint. (HF ran fp32 on the same A100; transformers
+  5.13 needed the `torch_dtype`→`dtype` kwarg fix.)
+- **Single-stream decode: 48.3 tok/s** (TTFT 20.9 ms, ITL 20.7 ms),
+  `cmd/bench`, prompt 64, 128 steps.
+- **Aggregate (HTTP + continuous batching, `cmd/loadgen`):**
+
+  | concurrency | tok/s | TTFT p50 | TTFT p99 |
+  |------------:|------:|---------:|---------:|
+  | 1  | 81   | 16 ms  | 20 ms  |
+  | 8  | 366  | 56 ms  | 64 ms  |
+  | 32 | 1,211 | 117 ms | 198 ms |
+
+  ~15× throughput from batching (81→1211 tok/s) on the real model — the
+  Phase-3 continuous-batching curve, reproduced on A100 at 1.1B scale.
+
+Reading against the [Gemma reference](#external-reference-gemma-inference-speed):
+48 tok/s single-stream sits inside the hosted-**Gemma-3-27B** provider band
+(15–67 tok/s) — but for a 25× *smaller* model on *naive* kernels, so per
+parameter we're far off the frontier. That's the honest baseline the kernel
+endgame optimizes against, now measured on the target architecture with a
+real model. Config note: TinyLlama is fp32 here (4.4 GB) and fits the 40 GB
+A100 comfortably; a real 30B would need the W4 path (Phase 4) to fit, which
+is exactly why that phase exists. HF downloads warned `no HF_TOKEN`
+(fine for public TinyLlama; gated Llama/Gemma would need a Modal secret).
+
 ## External reference — Gemma inference speed
 
 Collected to calibrate what "fast" means for a 30B-class model, so the

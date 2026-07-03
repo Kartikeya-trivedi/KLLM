@@ -49,7 +49,11 @@ def main():
     out_root.mkdir(parents=True, exist_ok=True)
 
     tok = None if args.raw_ids else AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
+    # transformers >=5 renamed torch_dtype -> dtype; support both.
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype)
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype)
     model.to(args.device).eval()
 
     prompts = [
