@@ -10,8 +10,11 @@ CUTLASS, CUDA graphs). The two meet at a deliberately narrow C-ABI
 
 - [x] Walking skeleton: Go → shared lib → CUDA context → kernel launch →
       results verified in Go (`cmd/smoke`)
-- [ ] Phase 0: correctness spine (safetensors loader, tokenizer, cuBLAS
-      forward pass, offline HF oracle)
+- [x] Safetensors loader (single-file + sharded index) with tests; `cmd/inspect`
+- [x] Tiny 2-layer Llama-style test model generator
+      (`tools/make_test_model.py`, driven by raw token ids — no tokenizer)
+- [ ] Phase 0 remainder: weight upload, cuBLAS forward pass, greedy decode
+      matching `gen_reference.py` dumps; then tokenizer + sub-1B model
 
 ## Layout
 

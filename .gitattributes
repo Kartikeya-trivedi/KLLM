@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.dll binary
+*.so binary
+*.safetensors binary
+*.npy binary
