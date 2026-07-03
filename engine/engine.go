@@ -35,7 +35,12 @@ type Engine struct {
 	B     *backend.Handle
 	Cfg   *models.HFConfig
 	Alloc *kv.Allocator
+
+	maxStepTokens int // backend scratch bound: total tokens per forward step
 }
+
+// MaxStepTokens is the cap on concatenated tokens in one forward step.
+func (e *Engine) MaxStepTokens() int { return e.maxStepTokens }
 
 // New loads the backend library, creates the model from modelDir
 // (config.json + safetensors), uploads all weights, and finalizes.
@@ -82,7 +87,12 @@ func New(dllPath, modelDir string, opts Options) (*Engine, error) {
 		h.Close()
 		return nil, err
 	}
-	return &Engine{B: h, Cfg: cfg, Alloc: kv.NewAllocator(opts.NumBlocks, opts.BlockSize)}, nil
+	return &Engine{
+		B:             h,
+		Cfg:           cfg,
+		Alloc:         kv.NewAllocator(opts.NumBlocks, opts.BlockSize),
+		maxStepTokens: int(opts.MaxSeq),
+	}, nil
 }
 
 // Sequence is one generation stream: its KV block table plus position.

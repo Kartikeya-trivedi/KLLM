@@ -249,6 +249,67 @@ func TestPagedBatchMatchesSolo(t *testing.T) {
 	}
 }
 
+// TestSchedulerMatchesHF submits all reference prompts concurrently through
+// the continuous-batching scheduler and requires every stream to reproduce
+// HF's tokens exactly — correctness under mixed in-flight batches.
+func TestSchedulerMatchesHF(t *testing.T) {
+	e, man := getEngine(t)
+	dumps := repoPath("refdumps", "tiny-llama")
+
+	sched := engine.NewScheduler(e, 4) // smaller than prompt count: forces queueing
+	sched.Start()
+	defer sched.Stop()
+
+	type reply struct {
+		got []int32
+		err error
+	}
+	replies := make([]reply, len(man.Prompts))
+	refs := make([]refTokens, len(man.Prompts))
+	var wg sync.WaitGroup
+	for i := range man.Prompts {
+		raw, err := os.ReadFile(filepath.Join(dumps, fmt.Sprintf("prompt_%d", i), "tokens.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(raw, &refs[i]); err != nil {
+			t.Fatal(err)
+		}
+		events, err := sched.Submit(refs[i].InputIDs, len(refs[i].GeneratedIDs))
+		if err != nil {
+			t.Fatal(err)
+		}
+		wg.Add(1)
+		go func(i int, events <-chan engine.GenEvent) {
+			defer wg.Done()
+			for ev := range events {
+				if ev.Err != nil {
+					replies[i].err = ev.Err
+					return
+				}
+				if !ev.Done {
+					replies[i].got = append(replies[i].got, ev.Token)
+				}
+			}
+		}(i, events)
+	}
+	wg.Wait()
+
+	for i, r := range replies {
+		if r.err != nil {
+			t.Fatalf("prompt %d: %v", i, r.err)
+		}
+		if len(r.got) != len(refs[i].GeneratedIDs) {
+			t.Fatalf("prompt %d: got %d tokens, want %d", i, len(r.got), len(refs[i].GeneratedIDs))
+		}
+		for k := range r.got {
+			if r.got[k] != refs[i].GeneratedIDs[k] {
+				t.Fatalf("prompt %d step %d: token %d, HF got %d", i, k, r.got[k], refs[i].GeneratedIDs[k])
+			}
+		}
+	}
+}
+
 func maxAbsDiff(a, b []float32) float64 {
 	if len(a) != len(b) {
 		return math.Inf(1)
