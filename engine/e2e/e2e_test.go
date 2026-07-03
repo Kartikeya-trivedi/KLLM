@@ -15,6 +15,7 @@ import (
 	"kllm/engine"
 	"kllm/engine/backend"
 	"kllm/engine/npy"
+	"kllm/engine/oracle"
 )
 
 const (
@@ -48,7 +49,7 @@ var (
 func getEngine(t *testing.T) (*engine.Engine, manifest) {
 	t.Helper()
 	engOnce.Do(func() {
-		dll := repoPath("build", "toyengine_backend.dll")
+		dll := oracle.BackendLib()
 		model := repoPath("testmodels", "tiny-llama")
 		dumps := repoPath("refdumps", "tiny-llama")
 		for _, p := range []string{dll, model, dumps} {

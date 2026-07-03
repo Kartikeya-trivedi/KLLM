@@ -15,8 +15,18 @@ run on a separate 3x A6000 Linux box (sm_86).
 
 - Backend: `.\scripts\build_backend.ps1 -Arch sm_75` → `build\toyengine_backend.dll`
   (locates MSVC cl.exe via vswhere; do NOT use MinGW as nvcc host compiler)
-- Smoke: `go run .\cmd\smoke` from repo root — must print PASS
+- Full suite: `go vet ./...; go test -count=1 ./...` — the e2e* packages are
+  the correctness gates (each model variant in its own package/process
+  because the backend allows one model per process).
 - Rebuild the DLL after any backend/*.cu or *.h change; Go does not track it.
+- Regenerate test models/oracles (only if tools change):
+  `python tools/make_test_model.py` → `tools/gen_reference.py --raw-ids`;
+  `tools/quantize_w4.py` (emits + dequantized twin for its oracle);
+  `tools/make_test_moe.py` → gen_reference.py (mixtral) +
+  `tools/gen_reference_numpy_moe.py` (sigmoid variant).
+- Ampere/Linux gate: `$env:PYTHONIOENCODING='utf-8'; modal run
+  tools/modal_lab.py::build_and_test` (A10 sm_86, builds .so + cgo engine,
+  runs everything). Costs GPU-minutes — use as a gate, not the inner loop.
 
 ## Hard rules (from the plan)
 

@@ -21,7 +21,7 @@ import modal
 
 app = modal.App("kllm-lab")
 
-REPO_FILES = ["backend", "engine", "cmd", "go.mod", "scripts"]
+REPO_DIRS = ["backend", "engine", "cmd", "models", "server", "testmodels", "refdumps"]
 
 # Light image for the smoke check.
 smoke_image = modal.Image.debian_slim()
@@ -34,11 +34,13 @@ cuda_image = (
         "wget -q https://go.dev/dl/go1.26.2.linux-amd64.tar.gz -O /tmp/go.tgz",
         "tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz",
     )
-    .env({"PATH": "/usr/local/go/bin:/usr/local/cuda/bin:$PATH"})
+    .env({"PATH": "/usr/local/go/bin:/usr/local/cuda/bin:"
+                  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "CGO_ENABLED": "1"})
 )
-for name in REPO_FILES:
-    cuda_image = cuda_image.add_local_dir(name, remote_path=f"/repo/{name}") \
-        if name not in ("go.mod",) else cuda_image.add_local_file(name, remote_path="/repo/go.mod")
+cuda_image = cuda_image.add_local_file("go.mod", remote_path="/repo/go.mod")
+for name in REPO_DIRS:
+    cuda_image = cuda_image.add_local_dir(name, remote_path=f"/repo/{name}")
 
 
 @app.function(gpu="A10G", image=smoke_image, timeout=120)
@@ -64,8 +66,12 @@ def build_and_test():
     # Build the backend for sm_86 (real target arch).
     sh("mkdir -p build && nvcc -shared -O2 -lineinfo -arch=sm_86 -Xcompiler -fPIC "
        "-o build/libtoyengine.so backend/*.cu -lcublas")
-    # Build + test the Go engine (Linux uses the cgo loader when present;
-    # falls back to purego-style loading otherwise).
-    sh("go vet ./... && go test ./...")
+    # Build + test the Go engine through the Linux cgo loader.
+    sh("go vet ./...")
+    sh("go test -v -count=1 ./... 2>&1 | grep -E '^(ok|FAIL|--- (PASS|FAIL|SKIP))' || true")
+    sh("go test -count=1 ./...")
     sh("go run ./cmd/smoke --backend build/libtoyengine.so")
+    # Decode-shape matmul microbenchmark on real Ampere for the journal.
+    sh("go run ./cmd/wbench --backend build/libtoyengine.so "
+       "--shapes 4096x4096,11008x4096 --n 1 --iters 50")
     return "ok"
