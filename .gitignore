@@ -1,0 +1,8 @@
+build/
+refdumps/
+*.dll
+*.so
+*.lib
+*.exp
+*.exe
+__pycache__/
