@@ -22,6 +22,7 @@ type winImpl struct {
 	procFinalize       *syscall.Proc
 	procForward        *syscall.Proc
 	procResetKV        *syscall.Proc
+	procSetFusion      *syscall.Proc
 	procDebugSet       *syscall.Proc
 	procDebugCount     *syscall.Proc
 	procDebugSize      *syscall.Proc
@@ -51,6 +52,7 @@ func load(path string) (impl, error) {
 		{"te_model_finalize", &w.procFinalize},
 		{"te_forward", &w.procForward},
 		{"te_reset_kv", &w.procResetKV},
+		{"te_set_fusion", &w.procSetFusion},
 		{"te_debug_set", &w.procDebugSet},
 		{"te_debug_count", &w.procDebugCount},
 		{"te_debug_size", &w.procDebugSize},
@@ -66,10 +68,10 @@ func load(path string) (impl, error) {
 	return w, nil
 }
 
-// check converts a shim return code (signed; negative = TE_ERR_*) into a Go
-// error using te_last_error.
+// check converts a shim return code (C `int`, so 32-bit; negative = TE_ERR_*)
+// into a Go error using te_last_error.
 func (w *winImpl) check(fn string, rc uintptr) error {
-	code := int64(rc)
+	code := int32(uint32(rc))
 	if code == 0 {
 		return nil
 	}
@@ -111,6 +113,15 @@ func (w *winImpl) forward(tokens []int32, pos int, logits []float32) error {
 func (w *winImpl) resetKV() error {
 	rc, _, _ := w.procResetKV.Call()
 	return w.check("te_reset_kv", rc)
+}
+
+func (w *winImpl) setFusion(on bool) error {
+	v := uintptr(0)
+	if on {
+		v = 1
+	}
+	rc, _, _ := w.procSetFusion.Call(v)
+	return w.check("te_set_fusion", rc)
 }
 
 func (w *winImpl) debugSet(on bool) error {

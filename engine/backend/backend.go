@@ -47,6 +47,7 @@ type impl interface {
 	finalize() error
 	forward(tokens []int32, pos int, logits []float32) error
 	resetKV() error
+	setFusion(on bool) error
 	debugSet(on bool) error
 	debugCount() (int, error)
 	debugRead(idx int) ([]float32, error)
@@ -111,6 +112,10 @@ func (h *Handle) Forward(tokens []int32, pos int) ([]float32, error) {
 
 // ResetKV drops all cached KV (start a fresh sequence).
 func (h *Handle) ResetKV() error { return h.impl.resetKV() }
+
+// SetFusion toggles fused kernels (default on); the unfused path exists for
+// honest before/after benchmarking.
+func (h *Handle) SetFusion(on bool) error { return h.impl.setFusion(on) }
 
 // DebugSet toggles per-layer activation capture on te_forward.
 func (h *Handle) DebugSet(on bool) error { return h.impl.debugSet(on) }

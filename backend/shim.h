@@ -78,6 +78,10 @@ TE_API int te_forward(const int32_t* tokens, int64_t n, int64_t pos, float* logi
 // Drop all cached KV (start a fresh sequence).
 TE_API int te_reset_kv(void);
 
+// Toggle fused kernels (residual-add + RMSNorm). Default on; the unfused
+// path exists so speedups can be measured honestly in one binary.
+TE_API int te_set_fusion(int64_t enabled);
+
 // ---- Debug taps (correctness harness only) ---------------------------------
 // When enabled, each te_forward captures host copies of: embedding output,
 // every layer's residual-stream output, and the final-norm output
