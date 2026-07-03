@@ -179,6 +179,45 @@ prompts 4-48 tokens, HTTP end-to-end):
 batching should produce: the GPU step cost is near-flat in batch size at
 this scale (launch-bound), so batching is almost free throughput.
 
+## Phase 4 — W4 group-quant weights + dequant-fused matmul — DONE (correctness; speed deferred by design)
+
+Pipeline: `tools/quantize_w4.py` (numpy) group-quantizes all 14 projection
+matrices (symmetric int4, group 32 here / 128 at scale, packed nibbles +
+fp32 scales as `<base>.qweight`/`<base>.scales`); embeddings, lm_head, norms
+stay fp32. The Go loader recognizes the pair and ships it across a new
+`te_model_load_tensor_w4`; the forward pass dispatches per weight — W4
+dequant-fused kernel if quantized, cuBLAS if dense (mixed checkpoints just
+work). Triton prototyping was skipped deliberately: Triton has no Windows
+support, and the two-sided oracle below is a stronger validator anyway.
+
+**Validation trick worth keeping: the quantizer emits a second, DEQUANTIZED
+fp32 checkpoint, and HF runs on that.** The W4 engine must match those dumps
+to fp tolerance (per-layer 2e-4, logits 2e-3, tokens exact — all pass). This
+proves the kernel computes exactly `dequant(Q,S) @ x`, separating kernel
+bugs from quantization error. Quality-vs-fp32 is then a separate, honest
+question: on this ultra-quant-sensitive random tiny model, 2 of 5 greedy
+continuations remain identical to fp32; real 30B checkpoints tolerate W4
+far better (that measurement belongs to the 30B phase on Modal).
+
+Microbenchmark (`cmd/wbench`, decode shape n=1, GTX 1650):
+
+| weight (MxK) | fp32 cuBLAS | naive W4 | W4 effective GB/s |
+|--------------|-------------|----------|-------------------|
+| 4096x4096    | 0.60 ms (113 GB/s) | 1.52 ms | 5.9 |
+| 11008x4096   | 1.61 ms (112 GB/s) | 12.9 ms | 1.9 |
+| 4096x11008   | 1.66 ms (109 GB/s) | 2.76 ms | 8.7 |
+
+The brutal, useful result: cuBLAS fp32 already sits at the bandwidth roof,
+while the naive W4 kernel — one thread per output element, adjacent threads
+reading rows 2 KB apart (uncoalesced), X re-read per thread, no shared
+memory — throws away the 8x byte advantage and LOSES. The information-
+theoretic target is ~fp32/8 per matmul; the gap (3-50x vs that target) is
+precisely the deferred kernel-optimization work, now with a measured
+baseline, a clear mechanism (coalescing + reuse + occupancy), and `ncu`
+available to drive it. This is the roofline lesson of Phase 1 inverted: at
+these shapes the bytes DO dominate, so the kernel is finally the thing that
+matters.
+
 ## Phase 0 — original goals
 
 Goal: Go greedy-decodes `testmodels/tiny-llama` (2-layer, hidden 64, GQA 4/2,

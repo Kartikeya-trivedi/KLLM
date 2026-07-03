@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-DTYPE_NAMES = {"float32": "F32", "float16": "F16"}
+DTYPE_NAMES = {"float32": "F32", "float16": "F16", "uint8": "U8"}
 
 
 def save_safetensors(path: Path, tensors: dict):

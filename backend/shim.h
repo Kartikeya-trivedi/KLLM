@@ -69,6 +69,20 @@ TE_API int te_model_create(const TeModelConfig* cfg);
 // the device; the host buffer may be reused afterwards.
 TE_API int te_model_load_tensor(const char* name, const float* data, int64_t numel);
 
+// Upload one W4 group-quantized projection weight (registered under the
+// plain ".weight" name; the forward pass dispatches to the dequant-fused
+// matmul for it). q: [out][in/2] packed nibbles (even col low), value =
+// (nibble - 8) * scales[out][in/group].
+TE_API int te_model_load_tensor_w4(const char* name, const uint8_t* q,
+                                   const float* scales, int64_t out_dim,
+                                   int64_t in_dim, int64_t group);
+
+// Microbenchmark: time Y[n,m] = X[n,k] x W[m,k]^T over iters iterations.
+// mode 0 = fp32 cuBLAS, 1 = W4 dequant-fused kernel. Writes avg ms per
+// iteration to ms_out. Standalone (own allocations); requires te_init only.
+TE_API int te_bench_matmul(int64_t m, int64_t k, int64_t n, int64_t iters,
+                           int64_t mode, double* ms_out);
+
 // Validate that every weight the config requires has arrived; allocate KV
 // cache and scratch. After this the model is immutable and ready to run.
 TE_API int te_model_finalize(void);
