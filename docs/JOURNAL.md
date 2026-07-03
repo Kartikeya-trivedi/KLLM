@@ -291,6 +291,58 @@ and a correctness net that will catch any regression:
 (bf16→fp32 conversion or an fp16 compute path, sharded index already
 supported) + Modal A10G/A100 for VRAM — no new engine architecture.
 
+## Observability + experiment tracking — DONE
+
+Added a dependency-free metrics layer (`engine/metrics`): counters, gauges,
+histograms, rendered as Prometheus text exposition and as a JSON snapshot.
+The scheduler instruments every step — TTFT (submit→first token), ITL
+(inter-token), batch size, running/queued sequences, KV utilization, token
+and request counters, and an EWMA of aggregate decode tok/s. The server
+serves `GET /metrics` (Grafana-scrapeable) and `GET /stats.json` (the
+browser UI polls it for live server-wide tok/s). Verified live: a loadgen
+burst produced a fully-populated `/metrics` (48 requests, 1110 tokens, ~7.7K
+tok/s aggregate EWMA, populated TTFT/ITL/batch histograms).
+
+For experiment tracking specifically (the W&B ask), `cmd/bench` gained
+`--json` and `tools/wandb_bench.py` runs it across configs and logs
+`decode_tok_s`/TTFT/ITL to Weights & Biases, tagged by kernel version — so
+each kernel-optimization iteration is a tracked run and the speedups chart
+themselves. It degrades gracefully (runs the benches and prints numbers when
+wandb isn't installed), and has a `--serve-url` live mode that streams a
+running server's tok/s to W&B. Why not a native Go→W&B logger: W&B has no
+first-class Go SDK, so the honest split is **Prometheus for live serving
+metrics (Go-native) + W&B via the Python tools for experiment tracking**
+(the official SDK), which is also where the rest of the offline tooling
+already lives.
+
+## External reference — Gemma inference speed
+
+Collected to calibrate what "fast" means for a 30B-class model, so the
+engine's tok/s numbers have real targets (not just tiny-model figures).
+**Two very different numbers matter and are constantly conflated:**
+
+- **Single-stream decode** (one request, tokens/sec the user feels) — for
+  **Gemma 3 27B** across hosted API providers this is roughly **15–67 tok/s**
+  (Amazon ~67, Parasail ~40, Novita ~26, DeepInfra ~17, Nebius FP8 ~15),
+  a 3.4× spread; TTFT ~1.2–11.8 s. This is the memory-bound decode regime —
+  the number our per-request `ITL`/`decode_tok_s` should be compared to.
+- **Aggregate throughput** (all concurrent requests summed, via continuous
+  batching) — Gemma 3 4B ~**3,976 tok/s** on a single A100 40GB (vLLM),
+  Gemma 3 12B ~2.4K tok/s, and Gemma 3 27B ~**22K tok/s** on a 4×H100 node.
+  This is what our server-wide EWMA tok/s (`/metrics`) is the analogue of.
+
+Takeaways for this project: (1) single-stream 30B decode being only tens of
+tok/s is exactly the bandwidth-bound story from the Phase 4 roofline note —
+which is *why* W4 quantization is the headline lever. (2) The 100–1000×
+gap between single-stream and aggregate is continuous batching doing its job
+(Phase 3). (3) Provider spread of 3–5× at the same model = the kernel/serving
+stack is most of the performance, which is the whole thesis of building one.
+
+Sources: [Artificial Analysis — Gemma 3 27B providers](https://artificialanalysis.ai/models/gemma-3-27b/providers),
+[DatabaseMart A100 40GB vLLM benchmark](https://www.databasemart.com/blog/vllm-gpu-benchmark-a100-40gb),
+[HF gemma-3-27b-it tok/s discussion](https://huggingface.co/google/gemma-3-27b-it/discussions/39),
+[Google Cloud — Gemma 3 on Vertex AI](https://cloud.google.com/blog/products/ai-machine-learning/announcing-gemma-3-on-vertex-ai/).
+
 ## Phase 0 — original goals
 
 Goal: Go greedy-decodes `testmodels/tiny-llama` (2-layer, hidden 64, GQA 4/2,
