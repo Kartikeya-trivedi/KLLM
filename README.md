@@ -16,9 +16,11 @@ directly.
 > **New here? Read [docs/THEORY.md](docs/THEORY.md)** for the concepts
 > (KV cache, paged attention, continuous batching, quantization, MoE) and
 > **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for how the pieces fit and
-> how a request flows through. [docs/JOURNAL.md](docs/JOURNAL.md) is the
-> build log with every measured number; [docs/PLAN.md](docs/PLAN.md) is the
-> original plan.
+> how a request flows through. For the full graduate-primer treatment —
+> derivations, complexity math, hardware analysis, reading lists — see
+> **[docs/theory/](docs/theory/README.md)** (7 chapters).
+> [docs/JOURNAL.md](docs/JOURNAL.md) is the build log with every measured
+> number; [docs/PLAN.md](docs/PLAN.md) is the original plan.
 
 ## What works today
 
