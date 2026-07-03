@@ -218,6 +218,39 @@ available to drive it. This is the roofline lesson of Phase 1 inverted: at
 these shapes the bytes DO dominate, so the kernel is finally the thing that
 matters.
 
+## Phase 5 — MoE routing + grouped expert GEMM — DONE
+
+One MoE implementation, two routing families behind a `router_mode` switch:
+- **mode 0, softmax top-k renorm** (Mixtral/Qwen): softmax over all experts,
+  take top-k, renormalize. Oracle: HF `MixtralForCausalLM` on a tiny
+  4-expert/top-2 random model (`tools/make_test_moe.py`) — per-layer,
+  logits, and tokens all match (`e2emoe`).
+- **mode 1, sigmoid + expert-bias** (Sarvam/DeepSeek-V3 family): sigmoid
+  scores, top-k selected by score+bias, weights from the *unbiased* scores
+  normalized over the selection. HF has no class pairing this router with
+  plain Llama attention, so the oracle is a standalone numpy forward
+  (`tools/gen_reference_numpy_moe.py`) — same dump format, same harness
+  (`e2emoesig`). Passes at the same tolerances.
+
+Dataflow (the real grouped-GEMM structure, naive v0): router GEMM → top-k
+kernel on device → host builds the expert-sorted permutation (one small D2H
+per layer — a deliberate correctness-phase concession) → `gather_rows` →
+**per-expert segment GEMMs** (a loop over experts with variable row counts —
+the fused grouped kernel is deferred optimization work) → SwiGLU → weighted
+`scatter_add` un-permute (fp32 atomics; ~1e-7 nondeterminism, inside
+tolerance).
+
+Because expert GEMMs go through the same `mm()` dispatch as dense weights,
+**INT4 MoE fell out for free**: `quantize_w4.py` now also quantizes
+w1/w2/w3 (router gate stays fp32), and `e2emoew4` validates the quantized
+expert path against HF on the dequantized twin — exact within fp tolerance.
+That is the Sarvam-30B-INT4 serving path in miniature: sigmoid routing ✓,
+quantized experts ✓, continuous batching + paged KV underneath ✓.
+
+Correctness harness refactored into `engine/oracle` (shared by the four
+model-variant suites; each variant is its own test package because the
+backend allows one model per process).
+
 ## Phase 0 — original goals
 
 Goal: Go greedy-decodes `testmodels/tiny-llama` (2-layer, hidden 64, GQA 4/2,

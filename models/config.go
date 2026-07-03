@@ -29,6 +29,9 @@ type HFConfig struct {
 	// MoE (Mixtral naming; 0 = dense)
 	NumLocalExperts  int64 `json:"num_local_experts"`
 	NumExpertsPerTok int64 `json:"num_experts_per_tok"`
+	// kllm extension: "sigmoid_bias" selects sigmoid + expert-bias routing
+	// (Sarvam/DeepSeek-V3 family) instead of softmax top-k.
+	KllmRouter string `json:"kllm_router"`
 }
 
 // LoadConfig reads <dir>/config.json and applies HF defaults.
@@ -59,7 +62,7 @@ func (c *HFConfig) Backend(maxSeq int64) backend.ModelConfig {
 	if maxSeq == 0 {
 		maxSeq = c.MaxPositionEmbeddings
 	}
-	return backend.ModelConfig{
+	cfg := backend.ModelConfig{
 		Hidden:       c.HiddenSize,
 		NLayers:      c.NumHiddenLayers,
 		NHeads:       c.NumAttentionHeads,
@@ -73,4 +76,11 @@ func (c *HFConfig) Backend(maxSeq int64) backend.ModelConfig {
 		RopeTheta:    c.RopeTheta,
 		RMSEps:       c.RMSNormEps,
 	}
+	if cfg.NExperts > 0 {
+		cfg.MoeIntermediate = c.IntermediateSize // Mixtral: intermediate_size = expert width
+		if c.KllmRouter == "sigmoid_bias" {
+			cfg.RouterMode = 1
+		}
+	}
+	return cfg
 }

@@ -30,7 +30,9 @@ import numpy as np
 from make_test_model import save_safetensors
 
 QUANT_SUFFIXES = ("q_proj.weight", "k_proj.weight", "v_proj.weight", "o_proj.weight",
-                  "gate_proj.weight", "up_proj.weight", "down_proj.weight")
+                  "gate_proj.weight", "up_proj.weight", "down_proj.weight",
+                  # MoE expert FFNs (Mixtral naming); the router gate stays fp32.
+                  "w1.weight", "w2.weight", "w3.weight")
 
 
 def load_safetensors(path: Path) -> dict:

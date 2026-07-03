@@ -46,6 +46,17 @@ struct Model {
     float *x = nullptr, *xn = nullptr, *q = nullptr, *k = nullptr, *v = nullptr;
     float *attn = nullptr, *proj = nullptr, *mlp_out = nullptr;
     float *ff_gate = nullptr, *ff_up = nullptr;
+
+    // MoE scratch (allocated only when n_experts > 0); rows = max_seq*top_k.
+    float* d_router = nullptr;      // [max_seq, n_experts]
+    int32_t* d_topk_idx = nullptr;  // [max_seq, top_k]
+    float* d_topk_w = nullptr;      // [max_seq, top_k]
+    int32_t* d_perm_tok = nullptr;  // [rows] source/dest token per permuted row
+    float* d_perm_w = nullptr;      // [rows] routing weight per permuted row
+    float* d_xg = nullptr;          // [rows, hidden] gathered inputs
+    float* d_moe_gate = nullptr;    // [rows, moe_intermediate]
+    float* d_moe_up = nullptr;      // [rows, moe_intermediate]
+    float* d_moe_down = nullptr;    // [rows, hidden]
     float *d_last_hidden = nullptr;  // [TE_MAX_BATCH_SEQS, hidden]
     float* d_logits = nullptr;       // [TE_MAX_BATCH_SEQS, vocab]
     int32_t* d_tokens = nullptr;     // per concat token
@@ -237,6 +248,64 @@ __global__ void gather_rows_kernel(float* out, const float* in,
     for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x) dst[i] = src[i];
 }
 
+// MoE routing: one thread per token. mode 0 = softmax top-k renormalized
+// (Mixtral/Qwen); mode 1 = sigmoid scores, selection by score+bias, weights
+// from unbiased scores normalized over the selection (Sarvam/DSv3 family).
+#define TE_MAX_EXPERTS 64
+
+__global__ void route_kernel(int32_t* topk_idx, float* topk_w,
+                             const float* logits, int64_t n, int64_t n_exp,
+                             int64_t k, int64_t mode, const float* bias) {
+    int64_t t = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n) return;
+    const float* row = logits + t * n_exp;
+    float score[TE_MAX_EXPERTS], metric[TE_MAX_EXPERTS];
+    if (mode == 0) {
+        float mx = row[0];
+        for (int64_t e = 1; e < n_exp; e++) mx = fmaxf(mx, row[e]);
+        float sum = 0.f;
+        for (int64_t e = 0; e < n_exp; e++) {
+            score[e] = expf(row[e] - mx);
+            sum += score[e];
+        }
+        for (int64_t e = 0; e < n_exp; e++) {
+            score[e] /= sum;
+            metric[e] = score[e];
+        }
+    } else {
+        for (int64_t e = 0; e < n_exp; e++) {
+            score[e] = 1.f / (1.f + expf(-row[e]));
+            metric[e] = score[e] + bias[e];
+        }
+    }
+    bool used[TE_MAX_EXPERTS] = {false};
+    float wsum = 0.f;
+    for (int64_t i = 0; i < k; i++) {
+        int best = -1;
+        for (int64_t e = 0; e < n_exp; e++)
+            if (!used[e] && (best < 0 || metric[e] > metric[best])) best = (int)e;
+        used[best] = true;
+        topk_idx[t * k + i] = best;
+        topk_w[t * k + i] = score[best];
+        wsum += score[best];
+    }
+    for (int64_t i = 0; i < k; i++) topk_w[t * k + i] /= wsum;
+}
+
+// Un-permute: out[token] += w * rows[r] for each permuted row. Multiple
+// experts hit the same token, hence atomics (fp32 atomicAdd; ~1e-7
+// nondeterminism, inside test tolerances).
+__global__ void scatter_add_kernel(float* out, const float* rows,
+                                   const int32_t* perm_tok,
+                                   const float* perm_w, int64_t hidden) {
+    int64_t r = blockIdx.x;
+    float* dst = out + (int64_t)perm_tok[r] * hidden;
+    const float* src = rows + r * hidden;
+    float w = perm_w[r];
+    for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x)
+        atomicAdd(&dst[i], w * src[i]);
+}
+
 __global__ void silu_mul_kernel(float* gate, const float* up, int64_t n) {
     for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
          i += (int64_t)gridDim.x * blockDim.x) {
@@ -347,6 +416,74 @@ int mm(Model* m, const std::string& name, const float* X, float* Y,
     return gemm_rowmajor(m->cublas, wptr, X, Y, out_dim, n, in_dim);
 }
 
+// MoE FFN for layer l: route -> permute tokens by expert -> per-expert
+// segment GEMMs ("grouped GEMM" v0: a loop of segment GEMMs; the fused
+// grouped kernel is deferred optimization work) -> weighted un-permute.
+// Reads m->xn (post-norm hidden), writes m->mlp_out.
+int moe_forward(Model* m, int64_t l, int64_t n) {
+    const TeModelConfig& c = m->c;
+    int rc;
+
+    // Router logits + top-k on device.
+    const float* w_gate;
+    if ((rc = require(m, lname(l, "block_sparse_moe.gate.weight"), c.n_experts * c.hidden, &w_gate))) return rc;
+    if ((rc = gemm_rowmajor(m->cublas, w_gate, m->xn, m->d_router, c.n_experts, n, c.hidden))) return rc;
+    const float* bias = nullptr;
+    if (c.router_mode == 1)
+        if ((rc = require(m, lname(l, "block_sparse_moe.gate.e_score_correction_bias"), c.n_experts, &bias))) return rc;
+    route_kernel<<<grid_for(n), kBlock>>>(m->d_topk_idx, m->d_topk_w,
+                                          m->d_router, n, c.n_experts, c.top_k,
+                                          c.router_mode, bias);
+
+    // Host builds the expert-sorted permutation (small: n*top_k entries).
+    int64_t rows = n * c.top_k;
+    std::vector<int32_t> h_idx(rows);
+    std::vector<float> h_w(rows);
+    TE_CHECK(cudaMemcpy(h_idx.data(), m->d_topk_idx, rows * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    TE_CHECK(cudaMemcpy(h_w.data(), m->d_topk_w, rows * sizeof(float), cudaMemcpyDeviceToHost));
+
+    std::vector<int32_t> perm_tok(rows);
+    std::vector<float> perm_w(rows);
+    std::vector<int64_t> seg_size(c.n_experts, 0);
+    int64_t r = 0;
+    for (int64_t e = 0; e < c.n_experts; e++) {
+        for (int64_t t = 0; t < n; t++)
+            for (int64_t i = 0; i < c.top_k; i++)
+                if (h_idx[t * c.top_k + i] == e) {
+                    perm_tok[r] = (int32_t)t;
+                    perm_w[r] = h_w[t * c.top_k + i];
+                    r++;
+                    seg_size[e]++;
+                }
+    }
+    TE_CHECK(cudaMemcpy(m->d_perm_tok, perm_tok.data(), rows * sizeof(int32_t), cudaMemcpyHostToDevice));
+    TE_CHECK(cudaMemcpy(m->d_perm_w, perm_w.data(), rows * sizeof(float), cudaMemcpyHostToDevice));
+    gather_rows_kernel<<<(int)rows, kBlock>>>(m->d_xg, m->xn, m->d_perm_tok, c.hidden);
+
+    // Per-expert segment GEMMs over the permuted rows.
+    int64_t off = 0;
+    for (int64_t e = 0; e < c.n_experts; e++) {
+        int64_t ns = seg_size[e];
+        if (ns == 0) continue;
+        std::string epre = "block_sparse_moe.experts." + std::to_string(e) + ".";
+        const float* X = m->d_xg + off * c.hidden;
+        float* g = m->d_moe_gate + off * c.moe_intermediate;
+        float* u = m->d_moe_up + off * c.moe_intermediate;
+        float* d = m->d_moe_down + off * c.hidden;
+        if ((rc = mm(m, lname(l, (epre + "w1.weight").c_str()), X, g, c.moe_intermediate, c.hidden, ns))) return rc;
+        if ((rc = mm(m, lname(l, (epre + "w3.weight").c_str()), X, u, c.moe_intermediate, c.hidden, ns))) return rc;
+        silu_mul_kernel<<<grid_for(ns * c.moe_intermediate), kBlock>>>(g, u, ns * c.moe_intermediate);
+        if ((rc = mm(m, lname(l, (epre + "w2.weight").c_str()), g, d, c.hidden, c.moe_intermediate, ns))) return rc;
+        off += ns;
+    }
+
+    // Weighted un-permute into the residual contribution.
+    TE_CHECK(cudaMemset(m->mlp_out, 0, n * c.hidden * sizeof(float)));
+    scatter_add_kernel<<<(int)rows, kBlock>>>(m->mlp_out, m->d_moe_down,
+                                              m->d_perm_tok, m->d_perm_w, c.hidden);
+    return 0;
+}
+
 }  // namespace
 
 // ---- C-ABI ------------------------------------------------------------------
@@ -356,9 +493,18 @@ extern "C" {
 int te_model_create(const TeModelConfig* cfg) {
     if (g_model) TE_FAIL(TE_ERR_STATE, "model already created");
     if (!cfg) TE_FAIL(TE_ERR_ARG, "null config");
-    if (cfg->n_experts != 0)
-        TE_FAIL(TE_ERR_ARG, "MoE not implemented yet (n_experts=%lld)",
-                (long long)cfg->n_experts);
+    if (cfg->n_experts != 0) {
+        if (cfg->n_experts < 0 || cfg->n_experts > TE_MAX_EXPERTS)
+            TE_FAIL(TE_ERR_ARG, "n_experts %lld out of range (max %d)",
+                    (long long)cfg->n_experts, TE_MAX_EXPERTS);
+        if (cfg->top_k <= 0 || cfg->top_k > cfg->n_experts)
+            TE_FAIL(TE_ERR_ARG, "top_k %lld invalid for %lld experts",
+                    (long long)cfg->top_k, (long long)cfg->n_experts);
+        if (cfg->moe_intermediate <= 0)
+            TE_FAIL(TE_ERR_ARG, "moe_intermediate must be positive");
+        if (cfg->router_mode != 0 && cfg->router_mode != 1)
+            TE_FAIL(TE_ERR_ARG, "router_mode must be 0 (softmax) or 1 (sigmoid+bias)");
+    }
     if (cfg->hidden <= 0 || cfg->n_layers <= 0 || cfg->n_heads <= 0 ||
         cfg->n_kv_heads <= 0 || cfg->head_dim <= 0 || cfg->vocab <= 0 ||
         cfg->max_seq <= 0 || cfg->intermediate <= 0)
@@ -514,9 +660,21 @@ int te_model_finalize(void) {
         if ((rc = require_proj(m, lname(l, "self_attn.k_proj.weight"), m->kv_dim, c.hidden))) return rc;
         if ((rc = require_proj(m, lname(l, "self_attn.v_proj.weight"), m->kv_dim, c.hidden))) return rc;
         if ((rc = require_proj(m, lname(l, "self_attn.o_proj.weight"), c.hidden, m->q_dim))) return rc;
-        if ((rc = require_proj(m, lname(l, "mlp.gate_proj.weight"), c.intermediate, c.hidden))) return rc;
-        if ((rc = require_proj(m, lname(l, "mlp.up_proj.weight"), c.intermediate, c.hidden))) return rc;
-        if ((rc = require_proj(m, lname(l, "mlp.down_proj.weight"), c.hidden, c.intermediate))) return rc;
+        if (c.n_experts == 0) {
+            if ((rc = require_proj(m, lname(l, "mlp.gate_proj.weight"), c.intermediate, c.hidden))) return rc;
+            if ((rc = require_proj(m, lname(l, "mlp.up_proj.weight"), c.intermediate, c.hidden))) return rc;
+            if ((rc = require_proj(m, lname(l, "mlp.down_proj.weight"), c.hidden, c.intermediate))) return rc;
+        } else {
+            if ((rc = require(m, lname(l, "block_sparse_moe.gate.weight"), c.n_experts * c.hidden, nullptr))) return rc;
+            if (c.router_mode == 1)
+                if ((rc = require(m, lname(l, "block_sparse_moe.gate.e_score_correction_bias"), c.n_experts, nullptr))) return rc;
+            for (int64_t e = 0; e < c.n_experts; e++) {
+                std::string epre = "block_sparse_moe.experts." + std::to_string(e) + ".";
+                if ((rc = require_proj(m, lname(l, (epre + "w1.weight").c_str()), c.moe_intermediate, c.hidden))) return rc;
+                if ((rc = require_proj(m, lname(l, (epre + "w2.weight").c_str()), c.hidden, c.moe_intermediate))) return rc;
+                if ((rc = require_proj(m, lname(l, (epre + "w3.weight").c_str()), c.moe_intermediate, c.hidden))) return rc;
+            }
+        }
     }
 
     TE_CHECK(cudaMalloc(&m->kv, c.n_layers * 2 * c.kv_num_blocks *
@@ -531,6 +689,18 @@ int te_model_finalize(void) {
     TE_CHECK(cudaMalloc(&m->mlp_out, c.max_seq * c.hidden * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->ff_gate, c.max_seq * c.intermediate * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->ff_up, c.max_seq * c.intermediate * sizeof(float)));
+    if (c.n_experts > 0) {
+        int64_t rows = c.max_seq * c.top_k;
+        TE_CHECK(cudaMalloc(&m->d_router, c.max_seq * c.n_experts * sizeof(float)));
+        TE_CHECK(cudaMalloc(&m->d_topk_idx, c.max_seq * c.top_k * sizeof(int32_t)));
+        TE_CHECK(cudaMalloc(&m->d_topk_w, c.max_seq * c.top_k * sizeof(float)));
+        TE_CHECK(cudaMalloc(&m->d_perm_tok, rows * sizeof(int32_t)));
+        TE_CHECK(cudaMalloc(&m->d_perm_w, rows * sizeof(float)));
+        TE_CHECK(cudaMalloc(&m->d_xg, rows * c.hidden * sizeof(float)));
+        TE_CHECK(cudaMalloc(&m->d_moe_gate, rows * c.moe_intermediate * sizeof(float)));
+        TE_CHECK(cudaMalloc(&m->d_moe_up, rows * c.moe_intermediate * sizeof(float)));
+        TE_CHECK(cudaMalloc(&m->d_moe_down, rows * c.hidden * sizeof(float)));
+    }
     TE_CHECK(cudaMalloc(&m->d_last_hidden, TE_MAX_BATCH_SEQS * c.hidden * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->d_logits, TE_MAX_BATCH_SEQS * c.vocab * sizeof(float)));
     TE_CHECK(cudaMalloc(&m->d_tokens, c.max_seq * sizeof(int32_t)));
@@ -683,11 +853,16 @@ int te_forward_batch(int64_t n_seqs, const int32_t* tokens,
         if ((rc = mm(m, lname(l, "self_attn.o_proj.weight"), m->attn, m->proj, c.hidden, m->q_dim, n))) return rc;
         add_norm(m, n, m->proj, w_post_ln);  // x += attn proj; xn = norm(x)
 
-        // MLP block (output deferred into the next norm via `pending`)
-        if ((rc = mm(m, lname(l, "mlp.gate_proj.weight"), m->xn, m->ff_gate, c.intermediate, c.hidden, n))) return rc;
-        if ((rc = mm(m, lname(l, "mlp.up_proj.weight"), m->xn, m->ff_up, c.intermediate, c.hidden, n))) return rc;
-        silu_mul_kernel<<<grid_for(n * c.intermediate), kBlock>>>(m->ff_gate, m->ff_up, n * c.intermediate);
-        if ((rc = mm(m, lname(l, "mlp.down_proj.weight"), m->ff_gate, m->mlp_out, c.hidden, c.intermediate, n))) return rc;
+        // FFN block (output deferred into the next norm via `pending`):
+        // dense SwiGLU or MoE depending on the model.
+        if (c.n_experts > 0) {
+            if ((rc = moe_forward(m, l, n))) return rc;
+        } else {
+            if ((rc = mm(m, lname(l, "mlp.gate_proj.weight"), m->xn, m->ff_gate, c.intermediate, c.hidden, n))) return rc;
+            if ((rc = mm(m, lname(l, "mlp.up_proj.weight"), m->xn, m->ff_up, c.intermediate, c.hidden, n))) return rc;
+            silu_mul_kernel<<<grid_for(n * c.intermediate), kBlock>>>(m->ff_gate, m->ff_up, n * c.intermediate);
+            if ((rc = mm(m, lname(l, "mlp.down_proj.weight"), m->ff_gate, m->mlp_out, c.hidden, c.intermediate, n))) return rc;
+        }
         pending = m->mlp_out;
     }
 
