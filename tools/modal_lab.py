@@ -1,16 +1,22 @@
 """Modal GPU lab: run kllm's CUDA backend on real Ampere (A10G = sm_86, the
 same arch as the target A6000 engine box) without leaving the laptop.
 
-Two entrypoints:
+Entrypoints:
 
   modal run tools/modal_lab.py::gpu_smoke
       Cheap sanity check: confirms the account can get a GPU and prints it.
 
   modal run tools/modal_lab.py::build_and_test
-      Ships backend/ + engine/ + cmd/ + go.mod into a CUDA 12.8 devel
-      container, builds libtoyengine.so for sm_86, builds the Go engine
-      (cgo loader on Linux), and runs the smoke + test suite on the GPU.
-      This is the per-phase "real Ampere" correctness gate.
+      Ships the repo into a CUDA 12.8 devel container, builds
+      libtoyengine.so for sm_86, builds the Go engine (cgo loader on Linux),
+      and runs the smoke + test suite on the GPU. The per-phase "real
+      Ampere" correctness gate.
+
+  modal serve tools/modal_lab.py        (live, ephemeral — dies on Ctrl-C)
+  modal deploy tools/modal_lab.py       (persistent public URL)
+      Serves the inference engine + browser playground on an A10G. Modal
+      prints a public https URL; open it and generate tokens in the browser.
+      Scales to zero when idle, so it only bills GPU time while in use.
 
 Uses the active profile in ~/.modal.toml.
 """
@@ -41,6 +47,28 @@ cuda_image = (
 cuda_image = cuda_image.add_local_file("go.mod", remote_path="/repo/go.mod")
 for name in REPO_DIRS:
     cuda_image = cuda_image.add_local_dir(name, remote_path=f"/repo/{name}")
+
+# Serving image: copy the repo into the image (copy=True so build steps can
+# see it), prebuild the .so + Go binary, so container cold-start just runs it.
+serving_image = (
+    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
+    .apt_install("wget", "build-essential")
+    .run_commands(
+        "wget -q https://go.dev/dl/go1.26.2.linux-amd64.tar.gz -O /tmp/go.tgz",
+        "tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz",
+    )
+    .env({"PATH": "/usr/local/go/bin:/usr/local/cuda/bin:"
+                  "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+          "CGO_ENABLED": "1"})
+    .add_local_file("go.mod", remote_path="/repo/go.mod", copy=True)
+)
+for name in ["backend", "engine", "cmd", "models", "server", "testmodels"]:
+    serving_image = serving_image.add_local_dir(name, remote_path=f"/repo/{name}", copy=True)
+serving_image = serving_image.run_commands(
+    "cd /repo && mkdir -p build && nvcc -shared -O2 -lineinfo -arch=sm_86 "
+    "-Xcompiler -fPIC -o build/libtoyengine.so backend/*.cu -lcublas",
+    "cd /repo && go build -o /repo/kllm-serve ./cmd/serve",
+)
 
 
 @app.function(gpu="A10G", image=smoke_image, timeout=120)
@@ -75,3 +103,18 @@ def build_and_test():
     sh("go run ./cmd/wbench --backend build/libtoyengine.so "
        "--shapes 4096x4096,11008x4096 --n 1 --iters 50")
     return "ok"
+
+
+@app.function(gpu="A10G", image=serving_image, scaledown_window=300)
+@modal.concurrent(max_inputs=100)  # one container fans requests into the batch
+@modal.web_server(8080, startup_timeout=120)
+def serve():
+    # Launch the prebuilt Go server bound to the web port; the browser
+    # playground is at "/", the SSE API at "/v1/generate".
+    import subprocess
+    subprocess.Popen(
+        ["/repo/kllm-serve", "--addr", "0.0.0.0:8080",
+         "--backend", "build/libtoyengine.so", "--model", "testmodels/tiny-llama",
+         "--max-batch", "16", "--max-seq", "256", "--kv-blocks", "2048"],
+        cwd="/repo",
+    )
