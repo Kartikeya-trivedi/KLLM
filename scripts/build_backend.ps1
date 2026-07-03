@@ -34,9 +34,9 @@ $buildDir = Join-Path $repoRoot "build"
 New-Item -ItemType Directory -Force $buildDir | Out-Null
 
 $out = Join-Path $buildDir "toyengine_backend.dll"
-$sources = @(Join-Path $repoRoot "backend\shim.cu")
+$sources = @(Get-ChildItem (Join-Path $repoRoot "backend") -Filter *.cu | ForEach-Object { $_.FullName })
 
-$flags = @("-shared", "-arch=$Arch", "-ccbin", $ccbin, "-o", $out)
+$flags = @("-shared", "-arch=$Arch", "-ccbin", $ccbin, "-lcublas", "-o", $out)
 if ($Configuration -eq "Debug") {
     $flags += @("-g", "-G", "-lineinfo")
 } else {
