@@ -1,0 +1,25 @@
+{
+  "description": "Kernel-optimization loop: every attempt is validated by the full oracle suite before its numbers count. wbench = isolated decode-shape matmul (n=1); model_bench = end-to-end decode tok/s.",
+  "attempts": [
+    { "id": 0, "name": "baseline", "detail": "naive W4 (thread per output element) + 1-thread-per-(token,head) attention" },
+    { "id": 1, "name": "W4 v1: coalesced", "detail": "block per (row,token), warp reads 32 consecutive packed bytes, shared-mem reduction" },
+    { "id": 2, "name": "W4 v2: vectorized", "detail": "uint32 loads (8 weights/thread/iter), unrolled dequant" },
+    { "id": 3, "name": "parallel attention", "detail": "block per (token,head): cooperative scoring, shared softmax reductions, coalesced V pass" }
+  ],
+  "wbench": [
+    { "gpu": "GTX 1650", "shape": "4096x4096", "kernel": "fp32 cuBLAS", "attempt": null, "ms": 0.593, "gbps": 113.2 },
+    { "gpu": "GTX 1650", "shape": "4096x4096", "kernel": "w4 naive", "attempt": 0, "ms": 1.598, "gbps": 5.6 },
+    { "gpu": "GTX 1650", "shape": "4096x4096", "kernel": "w4 v1", "attempt": 1, "ms": 0.343, "gbps": 26.0 },
+    { "gpu": "GTX 1650", "shape": "4096x4096", "kernel": "w4 v2", "attempt": 2, "ms": 0.385, "gbps": 23.2 },
+    { "gpu": "GTX 1650", "shape": "11008x4096", "kernel": "fp32 cuBLAS", "attempt": null, "ms": 1.585, "gbps": 113.8 },
+    { "gpu": "GTX 1650", "shape": "11008x4096", "kernel": "w4 naive", "attempt": 0, "ms": 12.679, "gbps": 1.9 },
+    { "gpu": "GTX 1650", "shape": "11008x4096", "kernel": "w4 v1", "attempt": 1, "ms": 0.813, "gbps": 29.5 },
+    { "gpu": "GTX 1650", "shape": "11008x4096", "kernel": "w4 v2", "attempt": 2, "ms": 1.085, "gbps": 22.1 }
+  ],
+  "model_bench": [
+    { "gpu": "GTX 1650", "model": "tiny-llama-w4 (prompt 128, 384 steps)", "attempt": 0, "tok_s": 916.4, "itl_ms": 1.091 },
+    { "gpu": "GTX 1650", "model": "tiny-llama-w4 (prompt 128, 384 steps)", "attempt": 1, "tok_s": 913.6, "itl_ms": 1.095 },
+    { "gpu": "GTX 1650", "model": "tiny-llama-w4 (prompt 128, 384 steps)", "attempt": 2, "tok_s": 909.5, "itl_ms": 1.099 },
+    { "gpu": "GTX 1650", "model": "tiny-llama-w4 (prompt 128, 384 steps)", "attempt": 3, "tok_s": 1958.1, "itl_ms": 0.511 }
+  ]
+}

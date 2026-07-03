@@ -27,26 +27,33 @@ func main() {
 	}
 	defer h.Close()
 
-	fmt.Printf("%-14s %-6s %-12s %-12s %-10s %-14s %-14s\n",
-		"shape (MxK)", "n", "fp32 ms", "w4 ms", "speedup", "fp32 GB/s", "w4 GB/s")
+	// mode 0 = fp32 cuBLAS; 1..3 = W4 kernel attempts (naive, coalesced, vectorized)
+	names := []string{"fp32 cuBLAS", "w4 naive", "w4 v1 coalesced", "w4 v2 vectorized"}
+	fmt.Printf("%-14s %-6s %-18s %-10s %-12s %-12s\n",
+		"shape (MxK)", "n", "kernel", "ms", "eff GB/s", "vs fp32")
 	for _, s := range strings.Split(*shapes, ",") {
 		parts := strings.Split(strings.TrimSpace(s), "x")
 		m, _ := strconv.ParseInt(parts[0], 10, 64)
 		k, _ := strconv.ParseInt(parts[1], 10, 64)
-		fp32, err := h.BenchMatmul(m, k, *n, *iters, 0)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
+		var fp32 float64
+		for mode := int64(0); mode <= 3; mode++ {
+			ms, err := h.BenchMatmul(m, k, *n, *iters, mode)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error:", err)
+				os.Exit(1)
+			}
+			bytes := float64(m*k) * 4 // fp32 weight bytes
+			if mode > 0 {
+				bytes = float64(m*k)/2 + float64(m*k/128)*4 // packed + scales
+			}
+			speedup := "-"
+			if mode == 0 {
+				fp32 = ms
+			} else {
+				speedup = fmt.Sprintf("%.2fx", fp32/ms)
+			}
+			fmt.Printf("%-14s %-6d %-18s %-10.3f %-12.1f %-12s\n",
+				s, *n, names[mode], ms, bytes/(ms*1e6), speedup)
 		}
-		w4, err := h.BenchMatmul(m, k, *n, *iters, 1)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
-		fp32Bytes := float64(m*k) * 4
-		w4Bytes := float64(m*k)/2 + float64(m*k/128)*4
-		fmt.Printf("%-14s %-6d %-12.3f %-12.3f %-10.2f %-14.1f %-14.1f\n",
-			s, *n, fp32, w4, fp32/w4,
-			fp32Bytes/(fp32*1e6), w4Bytes/(w4*1e6))
 	}
 }

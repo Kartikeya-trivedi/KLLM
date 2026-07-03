@@ -25,6 +25,7 @@ type winImpl struct {
 	procFinalize       *syscall.Proc
 	procForwardBatch   *syscall.Proc
 	procSetFusion      *syscall.Proc
+	procSetKernels     *syscall.Proc
 	procDebugSet       *syscall.Proc
 	procDebugCount     *syscall.Proc
 	procDebugSize      *syscall.Proc
@@ -57,6 +58,7 @@ func load(path string) (impl, error) {
 		{"te_model_finalize", &w.procFinalize},
 		{"te_forward_batch", &w.procForwardBatch},
 		{"te_set_fusion", &w.procSetFusion},
+		{"te_set_kernels", &w.procSetKernels},
 		{"te_debug_set", &w.procDebugSet},
 		{"te_debug_count", &w.procDebugCount},
 		{"te_debug_size", &w.procDebugSize},
@@ -159,6 +161,11 @@ func (w *winImpl) setFusion(on bool) error {
 	}
 	rc, _, _ := w.procSetFusion.Call(v)
 	return w.check("te_set_fusion", rc)
+}
+
+func (w *winImpl) setKernels(w4, attn int64) error {
+	rc, _, _ := w.procSetKernels.Call(uintptr(w4), uintptr(attn))
+	return w.check("te_set_kernels", rc)
 }
 
 func (w *winImpl) debugSet(on bool) error {
