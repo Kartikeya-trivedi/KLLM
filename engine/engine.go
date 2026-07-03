@@ -4,6 +4,7 @@ package engine
 
 import (
 	"fmt"
+	"strings"
 
 	"kllm/engine/backend"
 	"kllm/engine/kv"
@@ -68,20 +69,9 @@ func New(dllPath, modelDir string, opts Options) (*Engine, error) {
 		return nil, err
 	}
 	defer m.Close()
-	for _, t := range m.Tensors() {
-		if t.Dtype != loader.F32 {
-			h.Close()
-			return nil, fmt.Errorf("tensor %s is %s; only F32 checkpoints supported so far", t.Name, t.Dtype)
-		}
-		raw, err := m.ReadTensor(t.Name)
-		if err != nil {
-			h.Close()
-			return nil, err
-		}
-		if err := h.LoadTensorF32(t.Name, raw); err != nil {
-			h.Close()
-			return nil, fmt.Errorf("uploading %s: %w", t.Name, err)
-		}
+	if err := uploadWeights(h, m); err != nil {
+		h.Close()
+		return nil, err
 	}
 	if err := h.Finalize(); err != nil {
 		h.Close()
@@ -93,6 +83,54 @@ func New(dllPath, modelDir string, opts Options) (*Engine, error) {
 		Alloc:         kv.NewAllocator(opts.NumBlocks, opts.BlockSize),
 		maxStepTokens: int(opts.MaxSeq),
 	}, nil
+}
+
+// uploadWeights sends every tensor across the boundary: fp32 tensors as-is,
+// W4 pairs (<base>.qweight U8 + <base>.scales F32, as written by
+// tools/quantize_w4.py) via the quantized path under the ".weight" name.
+func uploadWeights(h *backend.Handle, m *loader.Model) error {
+	for _, t := range m.Tensors() {
+		switch {
+		case strings.HasSuffix(t.Name, ".scales"):
+			continue // consumed with its .qweight partner
+		case strings.HasSuffix(t.Name, ".qweight"):
+			if t.Dtype != loader.U8 || len(t.Shape) != 2 {
+				return fmt.Errorf("%s: want 2-D U8, got %s %v", t.Name, t.Dtype, t.Shape)
+			}
+			base := strings.TrimSuffix(t.Name, ".qweight")
+			st, ok := m.Tensor(base + ".scales")
+			if !ok || st.Dtype != loader.F32 || len(st.Shape) != 2 {
+				return fmt.Errorf("%s: missing or malformed %s.scales", t.Name, base)
+			}
+			outDim, inDim := t.Shape[0], t.Shape[1]*2
+			groups := st.Shape[1]
+			if st.Shape[0] != outDim || groups <= 0 || inDim%groups != 0 {
+				return fmt.Errorf("%s: scales shape %v inconsistent with qweight %v", t.Name, st.Shape, t.Shape)
+			}
+			q, err := m.ReadTensor(t.Name)
+			if err != nil {
+				return err
+			}
+			scales, err := m.ReadTensor(base + ".scales")
+			if err != nil {
+				return err
+			}
+			if err := h.LoadTensorW4(base+".weight", q, scales, outDim, inDim, inDim/groups); err != nil {
+				return fmt.Errorf("uploading %s: %w", t.Name, err)
+			}
+		case t.Dtype == loader.F32:
+			raw, err := m.ReadTensor(t.Name)
+			if err != nil {
+				return err
+			}
+			if err := h.LoadTensorF32(t.Name, raw); err != nil {
+				return fmt.Errorf("uploading %s: %w", t.Name, err)
+			}
+		default:
+			return fmt.Errorf("tensor %s is %s; only F32 and W4 supported so far", t.Name, t.Dtype)
+		}
+	}
+	return nil
 }
 
 // Sequence is one generation stream: its KV block table plus position.

@@ -22,6 +22,13 @@ struct DeviceTensor {
     int64_t numel = 0;
 };
 
+// W4 group-quantized weight: packed nibbles + per-group scales on device.
+struct QuantTensor {
+    uint8_t* q = nullptr;    // [out][in/2], even col in low nibble
+    float* scales = nullptr; // [out][in/group]
+    int64_t out_dim = 0, in_dim = 0, group = 0;
+};
+
 struct Model {
     TeModelConfig c{};
     int64_t q_dim = 0;   // n_heads * head_dim
@@ -29,6 +36,7 @@ struct Model {
     bool finalized = false;
 
     std::unordered_map<std::string, DeviceTensor> w;
+    std::unordered_map<std::string, QuantTensor> qw;
 
     // Paged KV pool: [n_layers][2 (k,v)][num_blocks][block_size][kv_dim].
     // Go owns block tables + free list; the backend is sequence-stateless.
@@ -198,6 +206,28 @@ __global__ void attn_paged_kernel(float* out, const float* q,
     for (int64_t d = 0; d < head_dim; d++) orow[d] = acc[d];
 }
 
+// W4 dequant-fused matmul: Y[n,m] = X[n,k] x dequant(Q,S)[m,k]^T.
+// Naive one-thread-per-output-element version — correctness first; the
+// tiled/tensor-core version is the deferred kernel-optimization endgame.
+__global__ void matmul_w4_kernel(float* Y, const float* X, const uint8_t* Q,
+                                 const float* S, int64_t m, int64_t n,
+                                 int64_t k, int64_t group) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * m) return;
+    int64_t t = idx / m, r = idx % m;
+    const uint8_t* qrow = Q + r * (k / 2);
+    const float* srow = S + r * (k / group);
+    const float* xrow = X + t * k;
+    float acc = 0.f;
+    for (int64_t j = 0; j < k; j += 2) {
+        uint8_t byte = qrow[j >> 1];
+        float s = srow[j / group];  // group size is even: j, j+1 share a group
+        acc += (float)((int)(byte & 0xF) - 8) * s * xrow[j];
+        acc += (float)((int)(byte >> 4) - 8) * s * xrow[j + 1];
+    }
+    Y[t * m + r] = acc;
+}
+
 // Gather selected rows (each sequence's last token) before the LM head.
 __global__ void gather_rows_kernel(float* out, const float* in,
                                    const int32_t* idx, int64_t hidden) {
@@ -255,6 +285,17 @@ std::string lname(int64_t layer, const char* suffix) {
     return "model.layers." + std::to_string(layer) + "." + suffix;
 }
 
+// Finalize-time check: projection present either dense or quantized.
+int require_proj(Model* m, const std::string& name, int64_t out_dim, int64_t in_dim) {
+    auto qi = m->qw.find(name);
+    if (qi != m->qw.end()) {
+        if (qi->second.out_dim != out_dim || qi->second.in_dim != in_dim)
+            TE_FAIL(TE_ERR_STATE, "quant weight %s has wrong shape", name.c_str());
+        return 0;
+    }
+    return require(m, name, out_dim * in_dim, nullptr);
+}
+
 int debug_capture(Model* m, const float* dev, int64_t numel) {
     if (!m->debug) return 0;
     std::vector<float> host(numel);
@@ -283,6 +324,27 @@ void add_norm(Model* m, int64_t n, float* res, const float* w) {
         rmsnorm_kernel<<<(int)n, kBlock, kBlock * sizeof(float)>>>(
             m->xn, m->x, w, c.hidden, (float)c.rms_eps);
     }
+}
+
+// Projection matmul with per-weight dispatch: W4 dequant-fused kernel if the
+// weight arrived quantized, cuBLAS SGEMM otherwise.
+int mm(Model* m, const std::string& name, const float* X, float* Y,
+       int64_t out_dim, int64_t in_dim, int64_t n) {
+    auto qi = m->qw.find(name);
+    if (qi != m->qw.end()) {
+        const QuantTensor& t = qi->second;
+        if (t.out_dim != out_dim || t.in_dim != in_dim)
+            TE_FAIL(TE_ERR_STATE, "quant weight %s is [%lld,%lld], expected [%lld,%lld]",
+                    name.c_str(), (long long)t.out_dim, (long long)t.in_dim,
+                    (long long)out_dim, (long long)in_dim);
+        matmul_w4_kernel<<<grid_for(n * out_dim), kBlock>>>(
+            Y, X, t.q, t.scales, out_dim, n, in_dim, t.group);
+        return 0;
+    }
+    const float* wptr;
+    int rc = require(m, name, out_dim * in_dim, &wptr);
+    if (rc) return rc;
+    return gemm_rowmajor(m->cublas, wptr, X, Y, out_dim, n, in_dim);
 }
 
 }  // namespace
@@ -336,6 +398,104 @@ int te_model_load_tensor(const char* name, const float* data, int64_t numel) {
     return 0;
 }
 
+int te_model_load_tensor_w4(const char* name, const uint8_t* q,
+                            const float* scales, int64_t out_dim,
+                            int64_t in_dim, int64_t group) {
+    Model* m = g_model;
+    if (!m) TE_FAIL(TE_ERR_STATE, "no model");
+    if (m->finalized) TE_FAIL(TE_ERR_STATE, "model already finalized");
+    if (!name || !q || !scales || out_dim <= 0 || in_dim <= 0 || group <= 0)
+        TE_FAIL(TE_ERR_ARG, "bad w4 tensor args");
+    if (in_dim % 2 != 0 || in_dim % group != 0 || group % 2 != 0)
+        TE_FAIL(TE_ERR_ARG, "w4 %s: in_dim %lld / group %lld must be even and divide",
+                name, (long long)in_dim, (long long)group);
+    if (m->w.count(name) || m->qw.count(name))
+        TE_FAIL(TE_ERR_ARG, "duplicate tensor %s", name);
+
+    QuantTensor t;
+    t.out_dim = out_dim;
+    t.in_dim = in_dim;
+    t.group = group;
+    TE_CHECK(cudaMalloc(&t.q, out_dim * in_dim / 2));
+    TE_CHECK(cudaMalloc(&t.scales, out_dim * (in_dim / group) * sizeof(float)));
+    cudaError_t err = cudaMemcpy(t.q, q, out_dim * in_dim / 2, cudaMemcpyHostToDevice);
+    if (err == cudaSuccess)
+        err = cudaMemcpy(t.scales, scales, out_dim * (in_dim / group) * sizeof(float),
+                         cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(t.q);
+        cudaFree(t.scales);
+        TE_FAIL((int)err, "upload w4 %s: %s", name, cudaGetErrorString(err));
+    }
+    m->qw[name] = t;
+    return 0;
+}
+
+int te_bench_matmul(int64_t m_dim, int64_t k, int64_t n, int64_t iters,
+                    int64_t mode, double* ms_out) {
+    if (m_dim <= 0 || k <= 0 || n <= 0 || iters <= 0 || !ms_out)
+        TE_FAIL(TE_ERR_ARG, "bad bench args");
+    int64_t group = (k % 128 == 0) ? 128 : 32;
+    if (k % group != 0 || k % 2 != 0) TE_FAIL(TE_ERR_ARG, "k must be even");
+
+    float *X = nullptr, *Y = nullptr, *W = nullptr, *S = nullptr;
+    uint8_t* Q = nullptr;
+    cublasHandle_t handle = nullptr;
+    TE_CHECK(cudaMalloc(&X, n * k * sizeof(float)));
+    TE_CHECK(cudaMalloc(&Y, n * m_dim * sizeof(float)));
+    TE_CHECK(cudaMemset(X, 0, n * k * sizeof(float)));
+    if (mode == 0) {
+        TE_CHECK(cudaMalloc(&W, m_dim * k * sizeof(float)));
+        TE_CHECK(cudaMemset(W, 0, m_dim * k * sizeof(float)));
+        TE_CHECK_CUBLAS(cublasCreate(&handle));
+    } else {
+        TE_CHECK(cudaMalloc(&Q, m_dim * k / 2));
+        TE_CHECK(cudaMalloc(&S, m_dim * (k / group) * sizeof(float)));
+        TE_CHECK(cudaMemset(Q, 0x88, m_dim * k / 2));
+        TE_CHECK(cudaMemset(S, 0, m_dim * (k / group) * sizeof(float)));
+    }
+
+    const float one = 1.f, zero = 0.f;
+    auto run_once = [&]() -> int {
+        if (mode == 0) {
+            TE_CHECK_CUBLAS(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                                        (int)m_dim, (int)n, (int)k, &one, W,
+                                        (int)k, X, (int)k, &zero, Y, (int)m_dim));
+        } else {
+            matmul_w4_kernel<<<grid_for(n * m_dim), kBlock>>>(Y, X, Q, S, m_dim,
+                                                              n, k, group);
+        }
+        return 0;
+    };
+
+    int rc;
+    for (int i = 0; i < 3; i++)
+        if ((rc = run_once())) return rc;  // warmup
+    TE_CHECK(cudaDeviceSynchronize());
+
+    cudaEvent_t start, stop;
+    TE_CHECK(cudaEventCreate(&start));
+    TE_CHECK(cudaEventCreate(&stop));
+    TE_CHECK(cudaEventRecord(start));
+    for (int64_t i = 0; i < iters; i++)
+        if ((rc = run_once())) return rc;
+    TE_CHECK(cudaEventRecord(stop));
+    TE_CHECK(cudaEventSynchronize(stop));
+    float ms = 0.f;
+    TE_CHECK(cudaEventElapsedTime(&ms, start, stop));
+    *ms_out = (double)ms / (double)iters;
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cudaFree(X);
+    cudaFree(Y);
+    if (W) cudaFree(W);
+    if (Q) cudaFree(Q);
+    if (S) cudaFree(S);
+    if (handle) cublasDestroy(handle);
+    return 0;
+}
+
 int te_model_finalize(void) {
     Model* m = g_model;
     if (!m) TE_FAIL(TE_ERR_STATE, "no model");
@@ -350,13 +510,13 @@ int te_model_finalize(void) {
     for (int64_t l = 0; l < c.n_layers; l++) {
         if ((rc = require(m, lname(l, "input_layernorm.weight"), c.hidden, nullptr))) return rc;
         if ((rc = require(m, lname(l, "post_attention_layernorm.weight"), c.hidden, nullptr))) return rc;
-        if ((rc = require(m, lname(l, "self_attn.q_proj.weight"), m->q_dim * c.hidden, nullptr))) return rc;
-        if ((rc = require(m, lname(l, "self_attn.k_proj.weight"), m->kv_dim * c.hidden, nullptr))) return rc;
-        if ((rc = require(m, lname(l, "self_attn.v_proj.weight"), m->kv_dim * c.hidden, nullptr))) return rc;
-        if ((rc = require(m, lname(l, "self_attn.o_proj.weight"), c.hidden * m->q_dim, nullptr))) return rc;
-        if ((rc = require(m, lname(l, "mlp.gate_proj.weight"), c.intermediate * c.hidden, nullptr))) return rc;
-        if ((rc = require(m, lname(l, "mlp.up_proj.weight"), c.intermediate * c.hidden, nullptr))) return rc;
-        if ((rc = require(m, lname(l, "mlp.down_proj.weight"), c.hidden * c.intermediate, nullptr))) return rc;
+        if ((rc = require_proj(m, lname(l, "self_attn.q_proj.weight"), m->q_dim, c.hidden))) return rc;
+        if ((rc = require_proj(m, lname(l, "self_attn.k_proj.weight"), m->kv_dim, c.hidden))) return rc;
+        if ((rc = require_proj(m, lname(l, "self_attn.v_proj.weight"), m->kv_dim, c.hidden))) return rc;
+        if ((rc = require_proj(m, lname(l, "self_attn.o_proj.weight"), c.hidden, m->q_dim))) return rc;
+        if ((rc = require_proj(m, lname(l, "mlp.gate_proj.weight"), c.intermediate, c.hidden))) return rc;
+        if ((rc = require_proj(m, lname(l, "mlp.up_proj.weight"), c.intermediate, c.hidden))) return rc;
+        if ((rc = require_proj(m, lname(l, "mlp.down_proj.weight"), c.hidden, c.intermediate))) return rc;
     }
 
     TE_CHECK(cudaMalloc(&m->kv, c.n_layers * 2 * c.kv_num_blocks *
@@ -490,16 +650,9 @@ int te_forward_batch(int64_t n_seqs, const int32_t* tokens,
     float* pending = nullptr;
 
     for (int64_t l = 0; l < c.n_layers; l++) {
-        const float *w_in_ln, *w_post_ln, *w_q, *w_k, *w_v, *w_o, *w_gate, *w_up, *w_down;
+        const float *w_in_ln, *w_post_ln;
         if ((rc = require(m, lname(l, "input_layernorm.weight"), c.hidden, &w_in_ln))) return rc;
         if ((rc = require(m, lname(l, "post_attention_layernorm.weight"), c.hidden, &w_post_ln))) return rc;
-        if ((rc = require(m, lname(l, "self_attn.q_proj.weight"), m->q_dim * c.hidden, &w_q))) return rc;
-        if ((rc = require(m, lname(l, "self_attn.k_proj.weight"), m->kv_dim * c.hidden, &w_k))) return rc;
-        if ((rc = require(m, lname(l, "self_attn.v_proj.weight"), m->kv_dim * c.hidden, &w_v))) return rc;
-        if ((rc = require(m, lname(l, "self_attn.o_proj.weight"), c.hidden * m->q_dim, &w_o))) return rc;
-        if ((rc = require(m, lname(l, "mlp.gate_proj.weight"), c.intermediate * c.hidden, &w_gate))) return rc;
-        if ((rc = require(m, lname(l, "mlp.up_proj.weight"), c.intermediate * c.hidden, &w_up))) return rc;
-        if ((rc = require(m, lname(l, "mlp.down_proj.weight"), c.hidden * c.intermediate, &w_down))) return rc;
 
         // Attention block
         if (pending) {
@@ -509,9 +662,9 @@ int te_forward_batch(int64_t n_seqs, const int32_t* tokens,
             rmsnorm_kernel<<<(int)n, kBlock, kBlock * sizeof(float)>>>(
                 m->xn, m->x, w_in_ln, c.hidden, (float)c.rms_eps);
         }
-        if ((rc = gemm_rowmajor(m->cublas, w_q, m->xn, m->q, m->q_dim, n, c.hidden))) return rc;
-        if ((rc = gemm_rowmajor(m->cublas, w_k, m->xn, m->k, m->kv_dim, n, c.hidden))) return rc;
-        if ((rc = gemm_rowmajor(m->cublas, w_v, m->xn, m->v, m->kv_dim, n, c.hidden))) return rc;
+        if ((rc = mm(m, lname(l, "self_attn.q_proj.weight"), m->xn, m->q, m->q_dim, c.hidden, n))) return rc;
+        if ((rc = mm(m, lname(l, "self_attn.k_proj.weight"), m->xn, m->k, m->kv_dim, c.hidden, n))) return rc;
+        if ((rc = mm(m, lname(l, "self_attn.v_proj.weight"), m->xn, m->v, m->kv_dim, c.hidden, n))) return rc;
         rope_kernel<<<(int)n, kBlock>>>(m->q, m->d_positions, c.n_heads, c.head_dim, c.rope_theta);
         rope_kernel<<<(int)n, kBlock>>>(m->k, m->d_positions, c.n_kv_heads, c.head_dim, c.rope_theta);
 
@@ -527,14 +680,14 @@ int te_forward_batch(int64_t n_seqs, const int32_t* tokens,
             m->d_tables, max_blocks_per_seq, bs, c.n_heads, c.n_kv_heads,
             c.head_dim, m->kv_dim, 1.f / sqrtf((float)c.head_dim));
 
-        if ((rc = gemm_rowmajor(m->cublas, w_o, m->attn, m->proj, c.hidden, n, m->q_dim))) return rc;
+        if ((rc = mm(m, lname(l, "self_attn.o_proj.weight"), m->attn, m->proj, c.hidden, m->q_dim, n))) return rc;
         add_norm(m, n, m->proj, w_post_ln);  // x += attn proj; xn = norm(x)
 
         // MLP block (output deferred into the next norm via `pending`)
-        if ((rc = gemm_rowmajor(m->cublas, w_gate, m->xn, m->ff_gate, c.intermediate, n, c.hidden))) return rc;
-        if ((rc = gemm_rowmajor(m->cublas, w_up, m->xn, m->ff_up, c.intermediate, n, c.hidden))) return rc;
+        if ((rc = mm(m, lname(l, "mlp.gate_proj.weight"), m->xn, m->ff_gate, c.intermediate, c.hidden, n))) return rc;
+        if ((rc = mm(m, lname(l, "mlp.up_proj.weight"), m->xn, m->ff_up, c.intermediate, c.hidden, n))) return rc;
         silu_mul_kernel<<<grid_for(n * c.intermediate), kBlock>>>(m->ff_gate, m->ff_up, n * c.intermediate);
-        if ((rc = gemm_rowmajor(m->cublas, w_down, m->ff_gate, m->mlp_out, c.hidden, n, c.intermediate))) return rc;
+        if ((rc = mm(m, lname(l, "mlp.down_proj.weight"), m->ff_gate, m->mlp_out, c.hidden, c.intermediate, n))) return rc;
         pending = m->mlp_out;
     }
 

@@ -57,6 +57,8 @@ type impl interface {
 	smokeVectorAdd(a, b []float32) ([]float32, error)
 	modelCreate(cfg *ModelConfig) error
 	loadTensor(name string, f32raw []byte) error
+	loadTensorW4(name string, q, scales []byte, outDim, inDim, group int64) error
+	benchMatmul(m, k, n, iters, mode int64) (float64, error)
 	finalize() error
 	forwardBatch(seqs []SeqForward, logits []float32) error
 	setFusion(on bool) error
@@ -104,6 +106,25 @@ func (h *Handle) LoadTensorF32(name string, f32raw []byte) error {
 		return fmt.Errorf("tensor %s: byte length %d is not a positive multiple of 4", name, len(f32raw))
 	}
 	return h.impl.loadTensor(name, f32raw)
+}
+
+// LoadTensorW4 uploads a group-quantized int4 projection weight, registered
+// under the plain ".weight" name. q holds packed nibbles [outDim][inDim/2],
+// scales holds fp32 [outDim][inDim/group].
+func (h *Handle) LoadTensorW4(name string, q, scales []byte, outDim, inDim, group int64) error {
+	if int64(len(q)) != outDim*inDim/2 {
+		return fmt.Errorf("w4 %s: %d qweight bytes, want %d", name, len(q), outDim*inDim/2)
+	}
+	if int64(len(scales)) != outDim*(inDim/group)*4 {
+		return fmt.Errorf("w4 %s: %d scale bytes, want %d", name, len(scales), outDim*(inDim/group)*4)
+	}
+	return h.impl.loadTensorW4(name, q, scales, outDim, inDim, group)
+}
+
+// BenchMatmul times Y[n,m] = X[n,k] x W[m,k]^T on the device; mode 0 = fp32
+// cuBLAS, 1 = W4 dequant-fused kernel. Returns avg ms per iteration.
+func (h *Handle) BenchMatmul(m, k, n, iters, mode int64) (float64, error) {
+	return h.impl.benchMatmul(m, k, n, iters, mode)
 }
 
 // Finalize validates weight completeness and allocates KV + scratch.

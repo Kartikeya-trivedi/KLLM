@@ -19,6 +19,8 @@ type winImpl struct {
 	procSmokeVectorAdd *syscall.Proc
 	procModelCreate    *syscall.Proc
 	procLoadTensor     *syscall.Proc
+	procLoadTensorW4   *syscall.Proc
+	procBenchMatmul    *syscall.Proc
 	procFinalize       *syscall.Proc
 	procForwardBatch   *syscall.Proc
 	procSetFusion      *syscall.Proc
@@ -48,6 +50,8 @@ func load(path string) (impl, error) {
 		{"te_smoke_vector_add", &w.procSmokeVectorAdd},
 		{"te_model_create", &w.procModelCreate},
 		{"te_model_load_tensor", &w.procLoadTensor},
+		{"te_model_load_tensor_w4", &w.procLoadTensorW4},
+		{"te_bench_matmul", &w.procBenchMatmul},
 		{"te_model_finalize", &w.procFinalize},
 		{"te_forward_batch", &w.procForwardBatch},
 		{"te_set_fusion", &w.procSetFusion},
@@ -91,6 +95,31 @@ func (w *winImpl) loadTensor(name string, f32raw []byte) error {
 		uintptr(len(f32raw)/4),
 	)
 	return w.check("te_model_load_tensor", rc)
+}
+
+func (w *winImpl) loadTensorW4(name string, q, scales []byte, outDim, inDim, group int64) error {
+	cname := append([]byte(name), 0)
+	rc, _, _ := w.procLoadTensorW4.Call(
+		uintptr(unsafe.Pointer(&cname[0])),
+		uintptr(unsafe.Pointer(&q[0])),
+		uintptr(unsafe.Pointer(&scales[0])),
+		uintptr(outDim),
+		uintptr(inDim),
+		uintptr(group),
+	)
+	return w.check("te_model_load_tensor_w4", rc)
+}
+
+func (w *winImpl) benchMatmul(m, k, n, iters, mode int64) (float64, error) {
+	var ms float64
+	rc, _, _ := w.procBenchMatmul.Call(
+		uintptr(m), uintptr(k), uintptr(n), uintptr(iters), uintptr(mode),
+		uintptr(unsafe.Pointer(&ms)),
+	)
+	if err := w.check("te_bench_matmul", rc); err != nil {
+		return 0, err
+	}
+	return ms, nil
 }
 
 func (w *winImpl) finalize() error {
