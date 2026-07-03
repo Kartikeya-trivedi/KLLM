@@ -120,6 +120,11 @@ TE_API int te_forward_batch(int64_t n_seqs, const int32_t* tokens,
 // path exists so speedups can be measured honestly in one binary.
 TE_API int te_set_fusion(int64_t enabled);
 
+// Select kernel-optimization attempt versions (-1 leaves one unchanged).
+// w4: 0 naive, 1 coalesced+reduction, 2 vectorized (default).
+// attn: 0 thread-per-(token,head), 1 block-parallel (default).
+TE_API int te_set_kernels(int64_t w4_version, int64_t attn_version);
+
 // ---- Debug taps (correctness harness only) ---------------------------------
 // When enabled, each te_forward captures host copies of: embedding output,
 // every layer's residual-stream output, and the final-norm output

@@ -357,6 +357,69 @@ A100 comfortably; a real 30B would need the W4 path (Phase 4) to fit, which
 is exactly why that phase exists. HF downloads warned `no HF_TOKEN`
 (fine for public TinyLlama; gated Llama/Gemma would need a Modal secret).
 
+## Gemma 3 + Sarvam on A100 — DONE (the plan's target models, real checkpoints)
+
+**Sarvam-1 (2B, sarvamai/sarvam-1)** — plain-Llama arch, so it ran with zero
+engine changes: **16/16 greedy tokens match HF**, 21.8 tok/s single-stream,
+37 → 577 tok/s aggregate (conc 1 → 32) on A100. First run OOM'd and taught a
+real serving lesson: KV pool size must be computed from model dims (28
+layers x kv_dim 1024 made a fixed 8192-block pool a 30 GiB allocation);
+`bench_model` now sizes the pool from config with an 8 GiB cap.
+
+**Gemma 3 1B (unsloth/gemma-3-1b-it)** — needed genuine architecture work:
+(1+w)-parameterized RMSNorm, embedding scaling by sqrt(hidden), GELU-tanh,
+per-head qk-norm, sandwich norms (4 per layer), sliding-window attention
+(512) with per-layer rope theta (10k local / 1M global), decoupled head_dim
+(256 != hidden/heads), query_pre_attn_scalar. Validated the same way as
+everything else: a tiny random Gemma3 (HF-loadable) + per-layer oracle
+(`validate_gemma` on Modal) — then the real model: **16/16 tokens match HF**
+on A100, 15.1 tok/s single-stream (naive kernels; the 262K-vocab lm_head
+GEMM alone reads 1.2 GB/token in fp32).
+
+Two debugging lessons the per-layer oracle made cheap:
+1. It localized the divergence to *the first full-attention layer* in one
+   read, which unmasked a transformers-5 config change: top-level
+   `rope_theta`/`rope_local_base_freq` are gone, replaced by a nested
+   `rope_parameters` dict per layer type. The Go parser fell back to the 10k
+   default — sliding layers *accidentally correct*, global layers wrong.
+2. `layer_types` beats formulas: the sliding/full assignment is now passed
+   explicitly across the ABI (`te_model_set_layer_sliding`), with the
+   converter asking transformers' own runtime config for the authoritative
+   list rather than re-deriving it from `sliding_window_pattern`.
+
+## Kernel-optimization loop — attempts, measured (graph: docs/assets/kernel_progress.png)
+
+The deferred endgame, run as a loop: change one kernel → full oracle suite
+must stay green (all 7 model-variant suites now run against the NEW kernels
+by default) → measure → log ([bench/kernel_attempts.json](../bench/kernel_attempts.json))
+→ plot (`tools/plot_kernels.py`). Kernel versions stay runtime-selectable
+(`te_set_kernels`) so every attempt remains reproducible in one binary.
+
+| # | attempt | W4 4096x4096 (1650) | W4 11008x4096 (1650) | tiny-model tok/s (seq~512) |
+|---|---------|--------------------:|---------------------:|---------------------------:|
+| 0 | naive baseline | 5.6 GB/s (0.37x fp32) | 1.9 GB/s (0.13x) | 916 |
+| 1 | W4 coalesced + shared reduction | **26.0 GB/s (1.73x fp32)** | **29.5 GB/s (1.95x)** | 914 |
+| 2 | W4 vectorized uint32 loads | 23.2 GB/s (1.54x) | 22.1 GB/s (1.46x) | 910 |
+| 3 | parallel paged attention | — | — | **1958 (2.14x)** |
+
+Readings:
+- **Attempt 1 crosses the line that matters**: the W4 kernel now beats cuBLAS
+  fp32 (1.7–2.0x) instead of losing 3–8x — a 4.7–15.6x kernel-level jump —
+  by fixing exactly what the Phase-4 baseline diagnosed (uncoalesced Q rows,
+  no X reuse, one thread per output). Block-per-row + byte-strided warp
+  reads + shared-mem reduction.
+- **Attempt 2 is an honest regression on Turing**: uint32 vectorized loads
+  measured *slower* than v1 on the 1650 (fewer, fatter iterations hide
+  latency worse at this occupancy). Logged, kept selectable, re-judged on
+  Ampere below.
+- **Attempt 3 is the big end-to-end win**: block-parallel attention (256
+  threads/[token,head] with shared-softmax) doubled decode throughput at
+  seq~512 — the 1-thread-per-(token,head) baseline had become the dominant
+  cost as sequences grew.
+- Headroom stays honest: v1's ~29 GB/s is still ~4x under the 1650's
+  achievable bandwidth (cuBLAS reaches ~114 GB/s) — next levers are
+  shared-memory X staging, multiple rows per block, and float4 X loads.
+
 ## External reference — Gemma inference speed
 
 Collected to calibrate what "fast" means for a 30B-class model, so the

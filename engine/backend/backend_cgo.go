@@ -131,6 +131,10 @@ func (cgoImpl) setFusion(on bool) error {
 	return check("te_set_fusion", C.te_set_fusion(v))
 }
 
+func (cgoImpl) setKernels(w4, attn int64) error {
+	return check("te_set_kernels", C.te_set_kernels(C.int64_t(w4), C.int64_t(attn)))
+}
+
 func (cgoImpl) debugSet(on bool) error {
 	v := C.int64_t(0)
 	if on {

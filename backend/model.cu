@@ -69,6 +69,11 @@ struct Model {
     cublasHandle_t cublas = nullptr;
     bool fused = true;  // te_set_fusion
 
+    // Kernel-optimization attempt selectors (te_set_kernels). Defaults are
+    // the latest versions; older ones stay selectable for honest A/B.
+    int64_t w4_version = 2;    // 0 naive, 1 coalesced+reduce, 2 vectorized
+    int64_t attn_version = 1;  // 0 thread-per-(tok,head), 1 block-parallel
+
     // Explicit per-layer sliding flags (te_model_set_layer_sliding);
     // empty = derive from (l+1) % sliding_pattern.
     std::vector<int32_t> layer_sliding;
@@ -268,6 +273,140 @@ __global__ void matmul_w4_kernel(float* Y, const float* X, const uint8_t* Q,
     Y[t * m + r] = acc;
 }
 
+// Attempt 1: one block per (output row, token). Threads stride the packed
+// row byte-by-byte, so a warp reads 32 consecutive bytes (coalesced); X is
+// broadcast across all row-blocks and stays hot in L2. Shared-mem reduction.
+__global__ void matmul_w4_v1_kernel(float* Y, const float* X, const uint8_t* Q,
+                                    const float* S, int64_t m, int64_t k,
+                                    int64_t group) {
+    extern __shared__ float sh[];
+    int64_t r = blockIdx.x, t = blockIdx.y;
+    const uint8_t* qrow = Q + r * (k >> 1);
+    const float* srow = S + r * (k / group);
+    const float* xrow = X + t * k;
+    float acc = 0.f;
+    for (int64_t b = threadIdx.x; b < (k >> 1); b += blockDim.x) {
+        uint8_t byte = qrow[b];
+        int64_t j = b << 1;
+        float s = srow[j / group];
+        acc += (float)((int)(byte & 0xF) - 8) * s * xrow[j];
+        acc += (float)((int)(byte >> 4) - 8) * s * xrow[j + 1];
+    }
+    sh[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) sh[threadIdx.x] += sh[threadIdx.x + s2];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) Y[t * m + r] = sh[0];
+}
+
+// Attempt 2: like v1 but each thread loads a uint32 (8 packed weights) per
+// stripe — a warp moves 128 consecutive bytes per instruction — and the
+// 8-weight inner loop is unrolled. Requires k % 8 == 0 and group % 8 == 0
+// (true for all real group sizes; the dispatcher falls back to v1 otherwise).
+__global__ void matmul_w4_v2_kernel(float* Y, const float* X, const uint8_t* Q,
+                                    const float* S, int64_t m, int64_t k,
+                                    int64_t group) {
+    extern __shared__ float sh[];
+    int64_t r = blockIdx.x, t = blockIdx.y;
+    const uint32_t* qrow = reinterpret_cast<const uint32_t*>(Q + r * (k >> 1));
+    const float* srow = S + r * (k / group);
+    const float* xrow = X + t * k;
+    int64_t words = k >> 3;  // uint32s per packed row
+    float acc = 0.f;
+    for (int64_t wi = threadIdx.x; wi < words; wi += blockDim.x) {
+        uint32_t word = qrow[wi];
+        int64_t j = wi << 3;
+        float s = srow[j / group];  // 8 weights never straddle a group
+#pragma unroll
+        for (int b = 0; b < 4; b++) {
+            uint32_t byte = (word >> (8 * b)) & 0xFFu;
+            acc += (float)((int)(byte & 0xF) - 8) * s * xrow[j + 2 * b];
+            acc += (float)((int)(byte >> 4) - 8) * s * xrow[j + 2 * b + 1];
+        }
+    }
+    sh[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) sh[threadIdx.x] += sh[threadIdx.x + s2];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) Y[t * m + r] = sh[0];
+}
+
+// Attempt 3: parallel paged attention — one block per (query token, head)
+// instead of one THREAD. Threads stride the cached positions for scoring,
+// shared-memory reductions produce the softmax max/sum, then threads stride
+// head_dim for the weighted-V pass (adjacent threads read adjacent V
+// columns — coalesced). Dynamic shared: score_cap scores + blockDim scratch.
+__global__ void attn_paged_par_kernel(float* out, const float* q,
+                                      const float* kpool, const float* vpool,
+                                      const int32_t* positions,
+                                      const int32_t* seq_ids,
+                                      const int32_t* tables, int64_t mbps,
+                                      int64_t block_size, int64_t n_heads,
+                                      int64_t n_kv, int64_t head_dim,
+                                      int64_t kv_dim, float scale,
+                                      int64_t window, int64_t score_cap) {
+    extern __shared__ float sh[];
+    float* scores = sh;            // [score_cap]
+    float* red = sh + score_cap;   // [blockDim]
+
+    int64_t t = blockIdx.x, h = blockIdx.y;
+    int64_t q_dim = n_heads * head_dim;
+    int64_t kvh = h / (n_heads / n_kv);
+    const float* qv = q + t * q_dim + h * head_dim;
+    const int32_t* table = tables + (int64_t)seq_ids[t] * mbps;
+    int64_t len = positions[t] + 1;
+    int64_t start = (window > 0 && len > window) ? len - window : 0;
+    int64_t cnt = len - start;
+
+    float lmax = -1e30f;
+    for (int64_t i = threadIdx.x; i < cnt; i += blockDim.x) {
+        int64_t p = start + i;
+        int64_t off = ((int64_t)table[p / block_size] * block_size + p % block_size) * kv_dim;
+        const float* krow = kpool + off + kvh * head_dim;
+        float dot = 0.f;
+        for (int64_t d = 0; d < head_dim; d++) dot += qv[d] * krow[d];
+        scores[i] = dot * scale;
+        lmax = fmaxf(lmax, scores[i]);
+    }
+    red[threadIdx.x] = lmax;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s2]);
+        __syncthreads();
+    }
+    float gmax = red[0];
+    __syncthreads();
+
+    float lsum = 0.f;
+    for (int64_t i = threadIdx.x; i < cnt; i += blockDim.x) {
+        scores[i] = expf(scores[i] - gmax);
+        lsum += scores[i];
+    }
+    red[threadIdx.x] = lsum;
+    __syncthreads();
+    for (int s2 = blockDim.x / 2; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) red[threadIdx.x] += red[threadIdx.x + s2];
+        __syncthreads();
+    }
+    float inv = 1.f / red[0];
+    __syncthreads();
+
+    float* orow = out + t * q_dim + h * head_dim;
+    for (int64_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.f;
+        for (int64_t i = 0; i < cnt; i++) {
+            int64_t p = start + i;
+            int64_t off = ((int64_t)table[p / block_size] * block_size + p % block_size) * kv_dim;
+            acc += scores[i] * vpool[off + kvh * head_dim + d];
+        }
+        orow[d] = acc * inv;
+    }
+}
+
 // Gather selected rows (each sequence's last token) before the LM head.
 __global__ void gather_rows_kernel(float* out, const float* in,
                                    const int32_t* idx, int64_t hidden) {
@@ -437,6 +576,23 @@ bool layer_is_sliding(const Model* m, int64_t l) {
     return c.sliding_pattern > 0 && ((l + 1) % c.sliding_pattern != 0);
 }
 
+// W4 kernel dispatch by attempt version (see Model::w4_version).
+void w4_matmul(int64_t version, float* Y, const float* X, const uint8_t* Q,
+               const float* S, int64_t m_dim, int64_t n, int64_t k,
+               int64_t group) {
+    if (version >= 2 && k % 8 == 0 && group % 8 == 0) {
+        dim3 grid((unsigned)m_dim, (unsigned)n);
+        matmul_w4_v2_kernel<<<grid, kBlock, kBlock * sizeof(float)>>>(
+            Y, X, Q, S, m_dim, k, group);
+    } else if (version >= 1) {
+        dim3 grid((unsigned)m_dim, (unsigned)n);
+        matmul_w4_v1_kernel<<<grid, kBlock, kBlock * sizeof(float)>>>(
+            Y, X, Q, S, m_dim, k, group);
+    } else {
+        matmul_w4_kernel<<<grid_for(n * m_dim), kBlock>>>(Y, X, Q, S, m_dim, n, k, group);
+    }
+}
+
 // Projection matmul with per-weight dispatch: W4 dequant-fused kernel if the
 // weight arrived quantized, cuBLAS SGEMM otherwise.
 int mm(Model* m, const std::string& name, const float* X, float* Y,
@@ -448,14 +604,32 @@ int mm(Model* m, const std::string& name, const float* X, float* Y,
             TE_FAIL(TE_ERR_STATE, "quant weight %s is [%lld,%lld], expected [%lld,%lld]",
                     name.c_str(), (long long)t.out_dim, (long long)t.in_dim,
                     (long long)out_dim, (long long)in_dim);
-        matmul_w4_kernel<<<grid_for(n * out_dim), kBlock>>>(
-            Y, X, t.q, t.scales, out_dim, n, in_dim, t.group);
+        w4_matmul(m->w4_version, Y, X, t.q, t.scales, out_dim, n, in_dim, t.group);
         return 0;
     }
     const float* wptr;
     int rc = require(m, name, out_dim * in_dim, &wptr);
     if (rc) return rc;
     return gemm_rowmajor(m->cublas, wptr, X, Y, out_dim, n, in_dim);
+}
+
+// Attention kernel dispatch by attempt version (see Model::attn_version).
+void attn_dispatch(Model* m, int64_t n, const float* kpool, const float* vpool,
+                   int64_t mbps, float scale, int64_t window) {
+    const TeModelConfig& c = m->c;
+    dim3 grid((unsigned)n, (unsigned)c.n_heads);
+    if (m->attn_version >= 1) {
+        size_t smem = (c.max_seq + kBlock) * sizeof(float);
+        attn_paged_par_kernel<<<grid, kBlock, smem>>>(
+            m->attn, m->q, kpool, vpool, m->d_positions, m->d_seq_ids,
+            m->d_tables, mbps, c.kv_block_size, c.n_heads, c.n_kv_heads,
+            c.head_dim, m->kv_dim, scale, window, c.max_seq);
+    } else {
+        attn_paged_kernel<<<grid, 1>>>(
+            m->attn, m->q, kpool, vpool, m->d_positions, m->d_seq_ids,
+            m->d_tables, mbps, c.kv_block_size, c.n_heads, c.n_kv_heads,
+            c.head_dim, m->kv_dim, scale, window);
+    }
 }
 
 // MoE FFN for layer l: route -> permute tokens by expert -> per-expert
@@ -654,8 +828,8 @@ int te_bench_matmul(int64_t m_dim, int64_t k, int64_t n, int64_t iters,
                                         (int)m_dim, (int)n, (int)k, &one, W,
                                         (int)k, X, (int)k, &zero, Y, (int)m_dim));
         } else {
-            matmul_w4_kernel<<<grid_for(n * m_dim), kBlock>>>(Y, X, Q, S, m_dim,
-                                                              n, k, group);
+            // mode 1 = naive W4, 2 = v1 coalesced, 3 = v2 vectorized
+            w4_matmul(mode - 1, Y, X, Q, S, m_dim, n, k, group);
         }
         return 0;
     };
@@ -782,6 +956,13 @@ int te_model_set_layer_sliding(const int32_t* sliding, int64_t n) {
 int te_set_fusion(int64_t enabled) {
     if (!g_model) TE_FAIL(TE_ERR_STATE, "no model");
     g_model->fused = enabled != 0;
+    return 0;
+}
+
+int te_set_kernels(int64_t w4_version, int64_t attn_version) {
+    if (!g_model) TE_FAIL(TE_ERR_STATE, "no model");
+    if (w4_version >= 0) g_model->w4_version = w4_version;
+    if (attn_version >= 0) g_model->attn_version = attn_version;
     return 0;
 }
 
@@ -918,11 +1099,7 @@ int te_forward_batch(int64_t n_seqs, const int32_t* tokens,
                 kpool, vpool, m->k, m->v, m->d_positions, m->d_seq_ids,
                 m->d_tables, max_blocks_per_seq, bs, m->kv_dim);
 
-            dim3 attn_grid((unsigned)n, (unsigned)c.n_heads);
-            attn_paged_kernel<<<attn_grid, 1>>>(
-                m->attn, m->q, kpool, vpool, m->d_positions, m->d_seq_ids,
-                m->d_tables, max_blocks_per_seq, bs, c.n_heads, c.n_kv_heads,
-                c.head_dim, m->kv_dim, attn_scale, window);
+            attn_dispatch(m, n, kpool, vpool, max_blocks_per_seq, attn_scale, window);
 
             if ((rc = mm(m, lname(l, "self_attn.o_proj.weight"), m->attn, m->proj, c.hidden, m->q_dim, n))) return rc;
             add_norm(m, n, m->proj, w_post_ln);  // x += attn proj; xn = norm(x)
@@ -976,11 +1153,7 @@ int te_forward_batch(int64_t n_seqs, const int32_t* tokens,
             kv_append_paged_kernel<<<(int)n, kBlock>>>(
                 kpool, vpool, m->k, m->v, m->d_positions, m->d_seq_ids,
                 m->d_tables, max_blocks_per_seq, bs, m->kv_dim);
-            dim3 attn_grid((unsigned)n, (unsigned)c.n_heads);
-            attn_paged_kernel<<<attn_grid, 1>>>(
-                m->attn, m->q, kpool, vpool, m->d_positions, m->d_seq_ids,
-                m->d_tables, max_blocks_per_seq, bs, c.n_heads, c.n_kv_heads,
-                c.head_dim, m->kv_dim, attn_scale, window);
+            attn_dispatch(m, n, kpool, vpool, max_blocks_per_seq, attn_scale, window);
 
             // x += post_attention_layernorm(o_proj(attn))
             if ((rc = mm(m, lname(l, "self_attn.o_proj.weight"), m->attn, m->proj, c.hidden, m->q_dim, n))) return rc;

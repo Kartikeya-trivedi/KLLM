@@ -22,9 +22,11 @@ func main() {
 	fused := flag.Bool("fused", true, "use fused kernels")
 	maxSeq := flag.Int64("max-seq", 512, "KV capacity")
 	asJSON := flag.Bool("json", false, "emit one JSON result object (for tools/wandb_bench.py)")
+	w4Kernel := flag.Int64("w4-kernel", -1, "W4 kernel version (-1 default, 0 naive, 1 coalesced, 2 vectorized)")
+	attnKernel := flag.Int64("attn-kernel", -1, "attention kernel version (-1 default, 0 naive, 1 parallel)")
 	flag.Parse()
 
-	if err := run(*dllPath, *modelDir, *device, *promptLen, *steps, *reps, *fused, *maxSeq, *asJSON); err != nil {
+	if err := run(*dllPath, *modelDir, *device, *promptLen, *steps, *reps, *fused, *maxSeq, *asJSON, *w4Kernel, *attnKernel); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -43,13 +45,16 @@ type Result struct {
 	DecodeTPS  float64 `json:"decode_tok_s"`
 }
 
-func run(dllPath, modelDir string, device, promptLen, steps, reps int, fused bool, maxSeq int64, asJSON bool) error {
+func run(dllPath, modelDir string, device, promptLen, steps, reps int, fused bool, maxSeq int64, asJSON bool, w4Kernel, attnKernel int64) error {
 	e, err := engine.New(dllPath, modelDir, engine.Options{Device: device, MaxSeq: maxSeq})
 	if err != nil {
 		return err
 	}
 	defer e.Close()
 	if err := e.B.SetFusion(fused); err != nil {
+		return err
+	}
+	if err := e.B.SetKernels(w4Kernel, attnKernel); err != nil {
 		return err
 	}
 

@@ -69,6 +69,7 @@ type impl interface {
 	finalize() error
 	forwardBatch(seqs []SeqForward, logits []float32) error
 	setFusion(on bool) error
+	setKernels(w4, attn int64) error
 	debugSet(on bool) error
 	debugCount() (int, error)
 	debugRead(idx int) ([]float32, error)
@@ -169,6 +170,10 @@ func (h *Handle) ForwardBatch(seqs []SeqForward) ([][]float32, error) {
 // SetFusion toggles fused kernels (default on); the unfused path exists for
 // honest before/after benchmarking.
 func (h *Handle) SetFusion(on bool) error { return h.impl.setFusion(on) }
+
+// SetKernels selects kernel-optimization attempt versions (-1 = unchanged).
+// w4: 0 naive, 1 coalesced, 2 vectorized. attn: 0 naive, 1 block-parallel.
+func (h *Handle) SetKernels(w4, attn int64) error { return h.impl.setKernels(w4, attn) }
 
 // DebugSet toggles per-layer activation capture on te_forward.
 func (h *Handle) DebugSet(on bool) error { return h.impl.debugSet(on) }
