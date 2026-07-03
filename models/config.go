@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"kllm/engine/backend"
 )
@@ -32,6 +33,69 @@ type HFConfig struct {
 	// kllm extension: "sigmoid_bias" selects sigmoid + expert-bias routing
 	// (Sarvam/DeepSeek-V3 family) instead of softmax top-k.
 	KllmRouter string `json:"kllm_router"`
+
+	// Gemma 3 (model_type gemma3_text)
+	HiddenActivation     string          `json:"hidden_activation"`
+	SlidingWindow        int64           `json:"sliding_window"`
+	SlidingWindowPattern int64           `json:"sliding_window_pattern"`
+	LayerTypes           []string        `json:"layer_types"`
+	RopeLocalBaseFreq    float64         `json:"rope_local_base_freq"`
+	QueryPreAttnScalar   float64         `json:"query_pre_attn_scalar"`
+	RopeScaling          json.RawMessage `json:"rope_scaling"`
+	// transformers >= 5 stops writing top-level rope_theta /
+	// rope_local_base_freq and nests them here instead (per layer type for
+	// hybrid-attention models). Parsed in LoadConfig.
+	RopeParameters json.RawMessage `json:"rope_parameters"`
+}
+
+type ropeParams struct {
+	RopeTheta float64 `json:"rope_theta"`
+	RopeType  string  `json:"rope_type"`
+}
+
+// applyRopeParameters folds the transformers-5 rope_parameters block into
+// the flat RopeTheta / RopeLocalBaseFreq fields the engine uses.
+func (c *HFConfig) applyRopeParameters() error {
+	if len(c.RopeParameters) == 0 || string(c.RopeParameters) == "null" {
+		return nil
+	}
+	check := func(p ropeParams, key string) error {
+		if p.RopeType != "" && p.RopeType != "default" {
+			return fmt.Errorf("rope_parameters.%s rope_type %q not supported (no rope scaling yet)", key, p.RopeType)
+		}
+		return nil
+	}
+	// Hybrid form: {"full_attention": {...}, "sliding_attention": {...}}
+	var keyed map[string]ropeParams
+	if err := json.Unmarshal(c.RopeParameters, &keyed); err == nil {
+		full, hasFull := keyed["full_attention"]
+		slide, hasSlide := keyed["sliding_attention"]
+		if hasFull || hasSlide {
+			if hasFull && full.RopeTheta > 0 {
+				if err := check(full, "full_attention"); err != nil {
+					return err
+				}
+				c.RopeTheta = full.RopeTheta
+			}
+			if hasSlide && slide.RopeTheta > 0 {
+				if err := check(slide, "sliding_attention"); err != nil {
+					return err
+				}
+				c.RopeLocalBaseFreq = slide.RopeTheta
+			}
+			return nil
+		}
+	}
+	// Flat form: {"rope_theta": ..., "rope_type": ...}
+	var flat ropeParams
+	if err := json.Unmarshal(c.RopeParameters, &flat); err == nil && flat.RopeTheta > 0 {
+		if err := check(flat, ""); err != nil {
+			return err
+		}
+		c.RopeTheta = flat.RopeTheta
+		return nil
+	}
+	return fmt.Errorf("unrecognized rope_parameters shape: %s", c.RopeParameters)
 }
 
 // LoadConfig reads <dir>/config.json and applies HF defaults.
@@ -52,6 +116,9 @@ func LoadConfig(dir string) (*HFConfig, error) {
 	}
 	if c.HeadDim == 0 {
 		c.HeadDim = c.HiddenSize / c.NumAttentionHeads
+	}
+	if err := c.applyRopeParameters(); err != nil {
+		return nil, err
 	}
 	return c, nil
 }
@@ -82,5 +149,52 @@ func (c *HFConfig) Backend(maxSeq int64) backend.ModelConfig {
 			cfg.RouterMode = 1
 		}
 	}
+	if strings.HasPrefix(c.ModelType, "gemma3") {
+		cfg.Arch = 1
+		cfg.SlidingWindow = c.SlidingWindow
+		cfg.SlidingPattern = c.SlidingWindowPattern
+		if cfg.SlidingPattern == 0 && len(c.LayerTypes) > 0 {
+			// Placeholder to pass create-time validation; the engine sends
+			// the explicit per-layer flags right after ModelCreate.
+			cfg.SlidingPattern = c.NumHiddenLayers + 1
+		}
+		cfg.RopeLocalTheta = c.RopeLocalBaseFreq
+		cfg.QueryScalar = c.QueryPreAttnScalar
+	}
 	return cfg
+}
+
+// LayerSlidingFlags converts layer_types into per-layer flags for the
+// backend (1 = sliding). nil when the checkpoint doesn't ship layer_types
+// (the backend then falls back to the (l+1)%pattern formula).
+func (c *HFConfig) LayerSlidingFlags() []int32 {
+	if len(c.LayerTypes) == 0 {
+		return nil
+	}
+	flags := make([]int32, len(c.LayerTypes))
+	for i, lt := range c.LayerTypes {
+		if lt == "sliding_attention" {
+			flags[i] = 1
+		}
+	}
+	return flags
+}
+
+// Validate rejects configs the backend would silently mis-run.
+func (c *HFConfig) Validate() error {
+	if strings.HasPrefix(c.ModelType, "gemma3") {
+		if c.HiddenActivation != "" && c.HiddenActivation != "gelu_pytorch_tanh" {
+			return fmt.Errorf("gemma3 activation %q not supported", c.HiddenActivation)
+		}
+		if len(c.RopeScaling) > 0 && string(c.RopeScaling) != "null" {
+			return fmt.Errorf("rope_scaling is set; the backend does not implement it yet")
+		}
+		if len(c.LayerTypes) > 0 && int64(len(c.LayerTypes)) != c.NumHiddenLayers {
+			return fmt.Errorf("layer_types has %d entries for %d layers", len(c.LayerTypes), c.NumHiddenLayers)
+		}
+		if c.SlidingWindow > 0 && len(c.LayerTypes) == 0 && c.SlidingWindowPattern <= 0 {
+			return fmt.Errorf("sliding_window set but neither layer_types nor sliding_window_pattern present")
+		}
+	}
+	return nil
 }

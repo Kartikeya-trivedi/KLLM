@@ -51,6 +51,9 @@ func New(dllPath, modelDir string, opts Options) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	h, err := backend.Load(dllPath, opts.Device)
 	if err != nil {
 		return nil, err
@@ -61,6 +64,14 @@ func New(dllPath, modelDir string, opts Options) (*Engine, error) {
 	if err := h.ModelCreate(bcfg); err != nil {
 		h.Close()
 		return nil, err
+	}
+	// Checkpoints that ship explicit layer_types are authoritative — the
+	// pattern formula differs across transformers versions.
+	if flags := cfg.LayerSlidingFlags(); flags != nil {
+		if err := h.SetLayerSliding(flags); err != nil {
+			h.Close()
+			return nil, err
+		}
 	}
 
 	m, err := loader.OpenModel(modelDir)

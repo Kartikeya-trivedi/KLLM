@@ -101,6 +101,12 @@ func (cgoImpl) benchMatmul(m, k, n, iters, mode int64) (float64, error) {
 	return float64(ms), err
 }
 
+func (cgoImpl) setLayerSliding(flags []int32) error {
+	return check("te_model_set_layer_sliding", C.te_model_set_layer_sliding(
+		(*C.int32_t)(unsafe.Pointer(&flags[0])),
+		C.int64_t(len(flags))))
+}
+
 func (cgoImpl) finalize() error {
 	return check("te_model_finalize", C.te_model_finalize())
 }

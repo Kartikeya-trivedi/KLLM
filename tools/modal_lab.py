@@ -126,6 +126,35 @@ def build_and_test():
     return "ok"
 
 
+@app.function(gpu="A10G", image=model_image, timeout=900)
+def validate_gemma():
+    """Gemma 3 correctness gate: build a tiny random Gemma3 with HF, dump the
+    oracle, and require the engine to match it layer-by-layer.
+
+        modal run tools/modal_lab.py::validate_gemma
+    """
+    import subprocess
+
+    def sh(cmd):
+        print(f"$ {cmd}", flush=True)
+        r = subprocess.run(cmd, shell=True, cwd="/repo", capture_output=True, text=True)
+        print(r.stdout, flush=True)
+        if r.returncode != 0:
+            print(r.stderr, flush=True)
+            raise RuntimeError(f"failed: {cmd}")
+        return r.stdout
+
+    sh("python tools/make_test_gemma.py --out-hf /tmp/hf-tiny-gemma")
+    sh("cat /tmp/hf-tiny-gemma/config.json")  # ground truth for rope params
+    sh("python tools/convert_hf.py --hf /tmp/hf-tiny-gemma --out testmodels/tiny-gemma3")
+    sh("python tools/gen_reference.py --model /tmp/hf-tiny-gemma "
+       "--prompts tools/prompts_tiny.txt --out refdumps/tiny-gemma3 "
+       "--raw-ids --max-new-tokens 16 --dtype float32 --device cuda")
+    sh("mkdir -p build && nvcc -shared -O2 -lineinfo -arch=sm_86 -Xcompiler -fPIC "
+       "-o build/libtoyengine.so backend/*.cu -lcublas")
+    return sh("go test -v -count=1 ./engine/e2egemma/")
+
+
 @app.function(gpu="A100", image=model_image, timeout=2400, volumes={"/cache": hf_cache})
 def bench_model(model_id: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                 prompt_len: int = 64, steps: int = 128):
@@ -200,9 +229,18 @@ def bench_model(model_id: str = "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
           f"(TTFT {single['ttft_ms']:.1f} ms, ITL {single['itl_ms']:.3f} ms)\n")
 
     # 5. Aggregate throughput via the continuous-batching server + loadgen.
+    # Size the KV pool from the model's dims (a fixed block count OOM'd on
+    # Sarvam-1: 28 layers x kv_dim 1024 made 8192 blocks a 30 GB pool).
+    cfg = json.load(open(M + "/config.json"))
+    kv_heads = cfg.get("num_key_value_heads") or cfg["num_attention_heads"]
+    head_dim = cfg.get("head_dim") or cfg["hidden_size"] // cfg["num_attention_heads"]
+    block_bytes = cfg["num_hidden_layers"] * 2 * 16 * kv_heads * head_dim * 4
+    need = (32 * 512) // 16 + 256                # max_batch x max_seq + slack
+    kv_blocks = min(need, (8 << 30) // block_bytes)  # cap pool at 8 GB
+    print(f"kv pool: {kv_blocks} blocks ({kv_blocks * block_bytes / 2**30:.1f} GiB)")
     srv = subprocess.Popen(
         ["/repo/bin/serve", "--backend", BK, "--model", M, "--addr", "127.0.0.1:8080",
-         "--max-batch", "32", "--max-seq", "512", "--kv-blocks", "8192"], cwd="/repo")
+         "--max-batch", "32", "--max-seq", "512", "--kv-blocks", str(kv_blocks)], cwd="/repo")
     try:
         for _ in range(60):
             try:

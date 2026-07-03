@@ -21,6 +21,7 @@ type winImpl struct {
 	procLoadTensor     *syscall.Proc
 	procLoadTensorW4   *syscall.Proc
 	procBenchMatmul    *syscall.Proc
+	procLayerSliding   *syscall.Proc
 	procFinalize       *syscall.Proc
 	procForwardBatch   *syscall.Proc
 	procSetFusion      *syscall.Proc
@@ -52,6 +53,7 @@ func load(path string) (impl, error) {
 		{"te_model_load_tensor", &w.procLoadTensor},
 		{"te_model_load_tensor_w4", &w.procLoadTensorW4},
 		{"te_bench_matmul", &w.procBenchMatmul},
+		{"te_model_set_layer_sliding", &w.procLayerSliding},
 		{"te_model_finalize", &w.procFinalize},
 		{"te_forward_batch", &w.procForwardBatch},
 		{"te_set_fusion", &w.procSetFusion},
@@ -120,6 +122,14 @@ func (w *winImpl) benchMatmul(m, k, n, iters, mode int64) (float64, error) {
 		return 0, err
 	}
 	return ms, nil
+}
+
+func (w *winImpl) setLayerSliding(flags []int32) error {
+	rc, _, _ := w.procLayerSliding.Call(
+		uintptr(unsafe.Pointer(&flags[0])),
+		uintptr(len(flags)),
+	)
+	return w.check("te_model_set_layer_sliding", rc)
 }
 
 func (w *winImpl) finalize() error {

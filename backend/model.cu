@@ -69,6 +69,10 @@ struct Model {
     cublasHandle_t cublas = nullptr;
     bool fused = true;  // te_set_fusion
 
+    // Explicit per-layer sliding flags (te_model_set_layer_sliding);
+    // empty = derive from (l+1) % sliding_pattern.
+    std::vector<int32_t> layer_sliding;
+
     bool debug = false;
     std::vector<std::vector<float>> dbg;  // host copies of residual stream
 };
@@ -85,9 +89,12 @@ __global__ void embed_gather_kernel(float* out, const float* embed,
     for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x) dst[i] = src[i];
 }
 
-// One block per token; blockDim must be a power of two.
+// One block per row; blockDim must be a power of two. plus_one selects the
+// Gemma parameterization out = x * rsqrt(ms+eps) * (1 + w) (weights stored
+// zero-centered) vs the Llama out = x * rsqrt(ms+eps) * w. Safe in-place
+// (out == in): each element is read and written by the same thread.
 __global__ void rmsnorm_kernel(float* out, const float* in, const float* w,
-                               int64_t hidden, float eps) {
+                               int64_t hidden, float eps, int plus_one) {
     extern __shared__ float sh[];
     const float* row = in + (int64_t)blockIdx.x * hidden;
     float* orow = out + (int64_t)blockIdx.x * hidden;
@@ -103,8 +110,27 @@ __global__ void rmsnorm_kernel(float* out, const float* in, const float* w,
         __syncthreads();
     }
     float scale = rsqrtf(sh[0] / (float)hidden + eps);
-    for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x)
-        orow[i] = row[i] * scale * w[i];
+    for (int64_t i = threadIdx.x; i < hidden; i += blockDim.x) {
+        float wi = plus_one ? 1.f + w[i] : w[i];
+        orow[i] = row[i] * scale * wi;
+    }
+}
+
+__global__ void scale_kernel(float* x, int64_t n, float s) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (int64_t)gridDim.x * blockDim.x) {
+        x[i] *= s;
+    }
+}
+
+// gate = gelu_tanh(gate) * up (Gemma's gelu_pytorch_tanh approximation).
+__global__ void gelu_tanh_mul_kernel(float* gate, const float* up, int64_t n) {
+    for (int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (int64_t)gridDim.x * blockDim.x) {
+        float x = gate[i];
+        float t = tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x));
+        gate[i] = 0.5f * x * (1.f + t) * up[i];
+    }
 }
 
 // Phase 1 fusion: x += res, then out = rmsnorm(x) * w, one pass instead of
@@ -182,35 +208,38 @@ __global__ void attn_paged_kernel(float* out, const float* q,
                                   const int32_t* tables, int64_t mbps,
                                   int64_t block_size, int64_t n_heads,
                                   int64_t n_kv, int64_t head_dim,
-                                  int64_t kv_dim, float scale) {
+                                  int64_t kv_dim, float scale,
+                                  int64_t window) {
     int64_t t = blockIdx.x, h = blockIdx.y;
     int64_t q_dim = n_heads * head_dim;
     int64_t kvh = h / (n_heads / n_kv);
     const float* qv = q + t * q_dim + h * head_dim;
     const int32_t* table = tables + (int64_t)seq_ids[t] * mbps;
     int64_t len = positions[t] + 1;  // causal: attend to positions [0, len)
+    int64_t start = 0;               // sliding layers see only the last `window`
+    if (window > 0 && len > window) start = len - window;
 
     float sc[TE_ATTN_MAX_SEQ];
     float maxs = -1e30f;
-    for (int64_t p = 0; p < len; p++) {
+    for (int64_t p = start; p < len; p++) {
         int64_t off = ((int64_t)table[p / block_size] * block_size + p % block_size) * kv_dim;
         const float* kv_row = kpool + off + kvh * head_dim;
         float dot = 0.f;
         for (int64_t d = 0; d < head_dim; d++) dot += qv[d] * kv_row[d];
-        sc[p] = dot * scale;
-        if (sc[p] > maxs) maxs = sc[p];
+        sc[p - start] = dot * scale;
+        if (sc[p - start] > maxs) maxs = sc[p - start];
     }
     float sum = 0.f;
-    for (int64_t p = 0; p < len; p++) {
-        sc[p] = expf(sc[p] - maxs);
-        sum += sc[p];
+    for (int64_t p = start; p < len; p++) {
+        sc[p - start] = expf(sc[p - start] - maxs);
+        sum += sc[p - start];
     }
     float acc[TE_ATTN_MAX_HEAD_DIM];
     for (int64_t d = 0; d < head_dim; d++) acc[d] = 0.f;
-    for (int64_t p = 0; p < len; p++) {
+    for (int64_t p = start; p < len; p++) {
         int64_t off = ((int64_t)table[p / block_size] * block_size + p % block_size) * kv_dim;
         const float* v_row = vpool + off + kvh * head_dim;
-        float wgt = sc[p] / sum;
+        float wgt = sc[p - start] / sum;
         for (int64_t d = 0; d < head_dim; d++) acc[d] += wgt * v_row[d];
     }
     float* orow = out + t * q_dim + h * head_dim;
@@ -382,7 +411,7 @@ int grid_for(int64_t n) {
 }
 
 // x += res, then xn = rmsnorm(x, w). Fused (1 kernel) or unfused (2), per
-// the te_set_fusion toggle — identical math either way.
+// the te_set_fusion toggle — identical math either way. Llama-path only.
 void add_norm(Model* m, int64_t n, float* res, const float* w) {
     const TeModelConfig& c = m->c;
     if (m->fused) {
@@ -391,8 +420,21 @@ void add_norm(Model* m, int64_t n, float* res, const float* w) {
     } else {
         add_inplace_kernel<<<grid_for(n * c.hidden), kBlock>>>(m->x, res, n * c.hidden);
         rmsnorm_kernel<<<(int)n, kBlock, kBlock * sizeof(float)>>>(
-            m->xn, m->x, w, c.hidden, (float)c.rms_eps);
+            m->xn, m->x, w, c.hidden, (float)c.rms_eps, 0);
     }
+}
+
+// Gemma-style norm: out = rmsnorm_{1+w}(in). Rows of width `width`.
+void norm_g(int64_t rows, float* out, const float* in, const float* w,
+            int64_t width, float eps) {
+    rmsnorm_kernel<<<(int)rows, kBlock, kBlock * sizeof(float)>>>(out, in, w, width, eps, 1);
+}
+
+bool layer_is_sliding(const Model* m, int64_t l) {
+    const TeModelConfig& c = m->c;
+    if (c.sliding_window <= 0) return false;
+    if (!m->layer_sliding.empty()) return m->layer_sliding[l] != 0;
+    return c.sliding_pattern > 0 && ((l + 1) % c.sliding_pattern != 0);
 }
 
 // Projection matmul with per-weight dispatch: W4 dequant-fused kernel if the
@@ -515,6 +557,10 @@ int te_model_create(const TeModelConfig* cfg) {
         TE_FAIL(TE_ERR_ARG, "max_seq/head_dim exceed naive-attention limits");
     if (cfg->kv_block_size <= 0 || cfg->kv_num_blocks <= 0)
         TE_FAIL(TE_ERR_ARG, "kv_block_size/kv_num_blocks must be positive");
+    if (cfg->arch != 0 && cfg->arch != 1)
+        TE_FAIL(TE_ERR_ARG, "arch must be 0 (llama) or 1 (gemma3)");
+    if (cfg->sliding_window > 0 && cfg->sliding_pattern <= 0)
+        TE_FAIL(TE_ERR_ARG, "sliding_window set but sliding_pattern is not");
 
     Model* m = new Model();
     m->c = *cfg;
@@ -656,6 +702,12 @@ int te_model_finalize(void) {
     for (int64_t l = 0; l < c.n_layers; l++) {
         if ((rc = require(m, lname(l, "input_layernorm.weight"), c.hidden, nullptr))) return rc;
         if ((rc = require(m, lname(l, "post_attention_layernorm.weight"), c.hidden, nullptr))) return rc;
+        if (c.arch == 1) {  // gemma3: sandwich norms + per-head qk-norm
+            if ((rc = require(m, lname(l, "pre_feedforward_layernorm.weight"), c.hidden, nullptr))) return rc;
+            if ((rc = require(m, lname(l, "post_feedforward_layernorm.weight"), c.hidden, nullptr))) return rc;
+            if ((rc = require(m, lname(l, "self_attn.q_norm.weight"), c.head_dim, nullptr))) return rc;
+            if ((rc = require(m, lname(l, "self_attn.k_norm.weight"), c.head_dim, nullptr))) return rc;
+        }
         if ((rc = require_proj(m, lname(l, "self_attn.q_proj.weight"), m->q_dim, c.hidden))) return rc;
         if ((rc = require_proj(m, lname(l, "self_attn.k_proj.weight"), m->kv_dim, c.hidden))) return rc;
         if ((rc = require_proj(m, lname(l, "self_attn.v_proj.weight"), m->kv_dim, c.hidden))) return rc;
@@ -713,6 +765,17 @@ int te_model_finalize(void) {
     TE_CHECK_CUBLAS(cublasCreate(&m->cublas));
 
     m->finalized = true;
+    return 0;
+}
+
+int te_model_set_layer_sliding(const int32_t* sliding, int64_t n) {
+    Model* m = g_model;
+    if (!m) TE_FAIL(TE_ERR_STATE, "no model");
+    if (m->finalized) TE_FAIL(TE_ERR_STATE, "model already finalized");
+    if (!sliding || n != m->c.n_layers)
+        TE_FAIL(TE_ERR_ARG, "layer flags length %lld != n_layers %lld",
+                (long long)n, (long long)m->c.n_layers);
+    m->layer_sliding.assign(sliding, sliding + n);
     return 0;
 }
 
@@ -812,66 +875,138 @@ int te_forward_batch(int64_t n_seqs, const int32_t* tokens,
     const float* w_embed;
     if ((rc = require(m, "model.embed_tokens.weight", c.vocab * c.hidden, &w_embed))) return rc;
     embed_gather_kernel<<<(int)n, kBlock>>>(m->x, w_embed, m->d_tokens, c.hidden);
+    if (c.arch == 1)  // gemma scales embeddings by sqrt(hidden)
+        scale_kernel<<<grid_for(n * c.hidden), kBlock>>>(m->x, n * c.hidden, sqrtf((float)c.hidden));
     if ((rc = debug_capture(m, m->x, n * c.hidden))) return rc;
 
-    // The residual add is deferred and fused into the NEXT norm: layer l's
-    // MLP output is added to x at the top of layer l+1 (or at the final
-    // norm). Debug captures move with it, preserving HF hidden_states order.
-    float* pending = nullptr;
+    const float attn_scale =
+        1.f / sqrtf(c.query_scalar > 0 ? (float)c.query_scalar : (float)c.head_dim);
+    const float eps = (float)c.rms_eps;
 
-    for (int64_t l = 0; l < c.n_layers; l++) {
-        const float *w_in_ln, *w_post_ln;
-        if ((rc = require(m, lname(l, "input_layernorm.weight"), c.hidden, &w_in_ln))) return rc;
-        if ((rc = require(m, lname(l, "post_attention_layernorm.weight"), c.hidden, &w_post_ln))) return rc;
+    if (c.arch == 0) {
+        // Llama family. The residual add is deferred and fused into the NEXT
+        // norm: layer l's MLP output is added to x at the top of layer l+1
+        // (or at the final norm). Debug captures move with it, preserving HF
+        // hidden_states order.
+        float* pending = nullptr;
 
-        // Attention block
-        if (pending) {
-            add_norm(m, n, pending, w_in_ln);  // x += prev MLP out; xn = norm(x)
-            if ((rc = debug_capture(m, m->x, n * c.hidden))) return rc;  // out of layer l-1
-        } else {
-            rmsnorm_kernel<<<(int)n, kBlock, kBlock * sizeof(float)>>>(
-                m->xn, m->x, w_in_ln, c.hidden, (float)c.rms_eps);
+        for (int64_t l = 0; l < c.n_layers; l++) {
+            const float *w_in_ln, *w_post_ln;
+            if ((rc = require(m, lname(l, "input_layernorm.weight"), c.hidden, &w_in_ln))) return rc;
+            if ((rc = require(m, lname(l, "post_attention_layernorm.weight"), c.hidden, &w_post_ln))) return rc;
+            bool sliding = layer_is_sliding(m, l);
+            double theta = (sliding && c.rope_local_theta > 0) ? c.rope_local_theta : c.rope_theta;
+            int64_t window = sliding ? c.sliding_window : 0;
+
+            // Attention block
+            if (pending) {
+                add_norm(m, n, pending, w_in_ln);  // x += prev MLP out; xn = norm(x)
+                if ((rc = debug_capture(m, m->x, n * c.hidden))) return rc;  // out of layer l-1
+            } else {
+                rmsnorm_kernel<<<(int)n, kBlock, kBlock * sizeof(float)>>>(
+                    m->xn, m->x, w_in_ln, c.hidden, eps, 0);
+            }
+            if ((rc = mm(m, lname(l, "self_attn.q_proj.weight"), m->xn, m->q, m->q_dim, c.hidden, n))) return rc;
+            if ((rc = mm(m, lname(l, "self_attn.k_proj.weight"), m->xn, m->k, m->kv_dim, c.hidden, n))) return rc;
+            if ((rc = mm(m, lname(l, "self_attn.v_proj.weight"), m->xn, m->v, m->kv_dim, c.hidden, n))) return rc;
+            rope_kernel<<<(int)n, kBlock>>>(m->q, m->d_positions, c.n_heads, c.head_dim, theta);
+            rope_kernel<<<(int)n, kBlock>>>(m->k, m->d_positions, c.n_kv_heads, c.head_dim, theta);
+
+            float* kpool = m->kv + (l * 2 + 0) * pool_stride;
+            float* vpool = m->kv + (l * 2 + 1) * pool_stride;
+            kv_append_paged_kernel<<<(int)n, kBlock>>>(
+                kpool, vpool, m->k, m->v, m->d_positions, m->d_seq_ids,
+                m->d_tables, max_blocks_per_seq, bs, m->kv_dim);
+
+            dim3 attn_grid((unsigned)n, (unsigned)c.n_heads);
+            attn_paged_kernel<<<attn_grid, 1>>>(
+                m->attn, m->q, kpool, vpool, m->d_positions, m->d_seq_ids,
+                m->d_tables, max_blocks_per_seq, bs, c.n_heads, c.n_kv_heads,
+                c.head_dim, m->kv_dim, attn_scale, window);
+
+            if ((rc = mm(m, lname(l, "self_attn.o_proj.weight"), m->attn, m->proj, c.hidden, m->q_dim, n))) return rc;
+            add_norm(m, n, m->proj, w_post_ln);  // x += attn proj; xn = norm(x)
+
+            // FFN block (output deferred into the next norm via `pending`):
+            // dense SwiGLU or MoE depending on the model.
+            if (c.n_experts > 0) {
+                if ((rc = moe_forward(m, l, n))) return rc;
+            } else {
+                if ((rc = mm(m, lname(l, "mlp.gate_proj.weight"), m->xn, m->ff_gate, c.intermediate, c.hidden, n))) return rc;
+                if ((rc = mm(m, lname(l, "mlp.up_proj.weight"), m->xn, m->ff_up, c.intermediate, c.hidden, n))) return rc;
+                silu_mul_kernel<<<grid_for(n * c.intermediate), kBlock>>>(m->ff_gate, m->ff_up, n * c.intermediate);
+                if ((rc = mm(m, lname(l, "mlp.down_proj.weight"), m->ff_gate, m->mlp_out, c.hidden, c.intermediate, n))) return rc;
+            }
+            pending = m->mlp_out;
         }
-        if ((rc = mm(m, lname(l, "self_attn.q_proj.weight"), m->xn, m->q, m->q_dim, c.hidden, n))) return rc;
-        if ((rc = mm(m, lname(l, "self_attn.k_proj.weight"), m->xn, m->k, m->kv_dim, c.hidden, n))) return rc;
-        if ((rc = mm(m, lname(l, "self_attn.v_proj.weight"), m->xn, m->v, m->kv_dim, c.hidden, n))) return rc;
-        rope_kernel<<<(int)n, kBlock>>>(m->q, m->d_positions, c.n_heads, c.head_dim, c.rope_theta);
-        rope_kernel<<<(int)n, kBlock>>>(m->k, m->d_positions, c.n_kv_heads, c.head_dim, c.rope_theta);
 
-        float* kpool = m->kv + (l * 2 + 0) * pool_stride;
-        float* vpool = m->kv + (l * 2 + 1) * pool_stride;
-        kv_append_paged_kernel<<<(int)n, kBlock>>>(
-            kpool, vpool, m->k, m->v, m->d_positions, m->d_seq_ids,
-            m->d_tables, max_blocks_per_seq, bs, m->kv_dim);
+        const float* w_norm;
+        if ((rc = require(m, "model.norm.weight", c.hidden, &w_norm))) return rc;
+        add_norm(m, n, pending, w_norm);  // x = last layer's output; xn = final norm
+        if ((rc = debug_capture(m, m->x, n * c.hidden))) return rc;
+        if ((rc = debug_capture(m, m->xn, n * c.hidden))) return rc;
+    } else {
+        // Gemma 3: (1+w) norms, per-head qk-norm before RoPE, sandwich norms
+        // around attention and MLP outputs, GELU-tanh MLP, sliding-window
+        // layers with their own rope theta. Eager residual adds (no fusion).
+        for (int64_t l = 0; l < c.n_layers; l++) {
+            const float *w_in_ln, *w_post_attn, *w_pre_ffw, *w_post_ffw, *w_qn, *w_kn;
+            if ((rc = require(m, lname(l, "input_layernorm.weight"), c.hidden, &w_in_ln))) return rc;
+            if ((rc = require(m, lname(l, "post_attention_layernorm.weight"), c.hidden, &w_post_attn))) return rc;
+            if ((rc = require(m, lname(l, "pre_feedforward_layernorm.weight"), c.hidden, &w_pre_ffw))) return rc;
+            if ((rc = require(m, lname(l, "post_feedforward_layernorm.weight"), c.hidden, &w_post_ffw))) return rc;
+            if ((rc = require(m, lname(l, "self_attn.q_norm.weight"), c.head_dim, &w_qn))) return rc;
+            if ((rc = require(m, lname(l, "self_attn.k_norm.weight"), c.head_dim, &w_kn))) return rc;
+            bool sliding = layer_is_sliding(m, l);
+            double theta = (sliding && c.rope_local_theta > 0) ? c.rope_local_theta : c.rope_theta;
+            int64_t window = sliding ? c.sliding_window : 0;
 
-        dim3 attn_grid((unsigned)n, (unsigned)c.n_heads);
-        attn_paged_kernel<<<attn_grid, 1>>>(
-            m->attn, m->q, kpool, vpool, m->d_positions, m->d_seq_ids,
-            m->d_tables, max_blocks_per_seq, bs, c.n_heads, c.n_kv_heads,
-            c.head_dim, m->kv_dim, 1.f / sqrtf((float)c.head_dim));
+            // Attention: norm -> qkv -> per-head qk-norm -> rope -> attend
+            norm_g(n, m->xn, m->x, w_in_ln, c.hidden, eps);
+            if ((rc = mm(m, lname(l, "self_attn.q_proj.weight"), m->xn, m->q, m->q_dim, c.hidden, n))) return rc;
+            if ((rc = mm(m, lname(l, "self_attn.k_proj.weight"), m->xn, m->k, m->kv_dim, c.hidden, n))) return rc;
+            if ((rc = mm(m, lname(l, "self_attn.v_proj.weight"), m->xn, m->v, m->kv_dim, c.hidden, n))) return rc;
+            norm_g(n * c.n_heads, m->q, m->q, w_qn, c.head_dim, eps);
+            norm_g(n * c.n_kv_heads, m->k, m->k, w_kn, c.head_dim, eps);
+            rope_kernel<<<(int)n, kBlock>>>(m->q, m->d_positions, c.n_heads, c.head_dim, theta);
+            rope_kernel<<<(int)n, kBlock>>>(m->k, m->d_positions, c.n_kv_heads, c.head_dim, theta);
 
-        if ((rc = mm(m, lname(l, "self_attn.o_proj.weight"), m->attn, m->proj, c.hidden, m->q_dim, n))) return rc;
-        add_norm(m, n, m->proj, w_post_ln);  // x += attn proj; xn = norm(x)
+            float* kpool = m->kv + (l * 2 + 0) * pool_stride;
+            float* vpool = m->kv + (l * 2 + 1) * pool_stride;
+            kv_append_paged_kernel<<<(int)n, kBlock>>>(
+                kpool, vpool, m->k, m->v, m->d_positions, m->d_seq_ids,
+                m->d_tables, max_blocks_per_seq, bs, m->kv_dim);
+            dim3 attn_grid((unsigned)n, (unsigned)c.n_heads);
+            attn_paged_kernel<<<attn_grid, 1>>>(
+                m->attn, m->q, kpool, vpool, m->d_positions, m->d_seq_ids,
+                m->d_tables, max_blocks_per_seq, bs, c.n_heads, c.n_kv_heads,
+                c.head_dim, m->kv_dim, attn_scale, window);
 
-        // FFN block (output deferred into the next norm via `pending`):
-        // dense SwiGLU or MoE depending on the model.
-        if (c.n_experts > 0) {
-            if ((rc = moe_forward(m, l, n))) return rc;
-        } else {
+            // x += post_attention_layernorm(o_proj(attn))
+            if ((rc = mm(m, lname(l, "self_attn.o_proj.weight"), m->attn, m->proj, c.hidden, m->q_dim, n))) return rc;
+            norm_g(n, m->xn, m->proj, w_post_attn, c.hidden, eps);
+            add_inplace_kernel<<<grid_for(n * c.hidden), kBlock>>>(m->x, m->xn, n * c.hidden);
+
+            // x += post_feedforward_layernorm(mlp(pre_feedforward_layernorm(x)))
+            norm_g(n, m->xn, m->x, w_pre_ffw, c.hidden, eps);
             if ((rc = mm(m, lname(l, "mlp.gate_proj.weight"), m->xn, m->ff_gate, c.intermediate, c.hidden, n))) return rc;
             if ((rc = mm(m, lname(l, "mlp.up_proj.weight"), m->xn, m->ff_up, c.intermediate, c.hidden, n))) return rc;
-            silu_mul_kernel<<<grid_for(n * c.intermediate), kBlock>>>(m->ff_gate, m->ff_up, n * c.intermediate);
+            gelu_tanh_mul_kernel<<<grid_for(n * c.intermediate), kBlock>>>(m->ff_gate, m->ff_up, n * c.intermediate);
             if ((rc = mm(m, lname(l, "mlp.down_proj.weight"), m->ff_gate, m->mlp_out, c.hidden, c.intermediate, n))) return rc;
+            norm_g(n, m->proj, m->mlp_out, w_post_ffw, c.hidden, eps);
+            add_inplace_kernel<<<grid_for(n * c.hidden), kBlock>>>(m->x, m->proj, n * c.hidden);
+
+            if ((rc = debug_capture(m, m->x, n * c.hidden))) return rc;
         }
-        pending = m->mlp_out;
+
+        const float* w_norm;
+        if ((rc = require(m, "model.norm.weight", c.hidden, &w_norm))) return rc;
+        norm_g(n, m->xn, m->x, w_norm, c.hidden, eps);
+        if ((rc = debug_capture(m, m->xn, n * c.hidden))) return rc;
     }
 
-    const float *w_norm, *w_lm;
-    if ((rc = require(m, "model.norm.weight", c.hidden, &w_norm))) return rc;
+    const float* w_lm;
     if ((rc = require(m, "lm_head.weight", c.vocab * c.hidden, &w_lm))) return rc;
-    add_norm(m, n, pending, w_norm);  // x = last layer's output; xn = final norm
-    if ((rc = debug_capture(m, m->x, n * c.hidden))) return rc;
-    if ((rc = debug_capture(m, m->xn, n * c.hidden))) return rc;
 
     // Logits for each sequence's last token only.
     gather_rows_kernel<<<(int)n_seqs, kBlock>>>(m->d_last_hidden, m->xn,

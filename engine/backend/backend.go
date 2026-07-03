@@ -30,8 +30,14 @@ type ModelConfig struct {
 	// Paged KV
 	KVBlockSize int64
 	KVNumBlocks int64
-	RopeTheta   float64
-	RMSEps      float64
+	// Architecture family (see TeModelConfig in backend/shim.h)
+	Arch           int64 // 0 = llama, 1 = gemma3
+	SlidingWindow  int64 // >0: sliding layers use this window
+	SlidingPattern int64 // layer l slides iff (l+1) % pattern != 0
+	RopeTheta      float64
+	RopeLocalTheta float64 // sliding layers (0 = same as RopeTheta)
+	QueryScalar    float64 // attn scale = 1/sqrt(this); 0 = head_dim
+	RMSEps         float64
 }
 
 // MaxBatchSeqs mirrors TE_MAX_BATCH_SEQS in shim.h.
@@ -59,6 +65,7 @@ type impl interface {
 	loadTensor(name string, f32raw []byte) error
 	loadTensorW4(name string, q, scales []byte, outDim, inDim, group int64) error
 	benchMatmul(m, k, n, iters, mode int64) (float64, error)
+	setLayerSliding(flags []int32) error
 	finalize() error
 	forwardBatch(seqs []SeqForward, logits []float32) error
 	setFusion(on bool) error
@@ -125,6 +132,12 @@ func (h *Handle) LoadTensorW4(name string, q, scales []byte, outDim, inDim, grou
 // cuBLAS, 1 = W4 dequant-fused kernel. Returns avg ms per iteration.
 func (h *Handle) BenchMatmul(m, k, n, iters, mode int64) (float64, error) {
 	return h.impl.benchMatmul(m, k, n, iters, mode)
+}
+
+// SetLayerSliding passes explicit per-layer sliding-attention flags
+// (from the checkpoint's layer_types), overriding the pattern formula.
+func (h *Handle) SetLayerSliding(flags []int32) error {
+	return h.impl.setLayerSliding(flags)
 }
 
 // Finalize validates weight completeness and allocates KV + scratch.
