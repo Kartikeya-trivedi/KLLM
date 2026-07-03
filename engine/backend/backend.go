@@ -168,3 +168,35 @@ func (h *Handle) DebugRead(idx int) ([]float32, error) { return h.impl.debugRead
 
 // Close releases the library handle. The CUDA context lives until process exit.
 func (h *Handle) Close() error { return h.impl.close() }
+
+// flattenBatch converts a batch into the C-ABI's parallel arrays. Table rows
+// are padded to the widest table with -1 (backend validates only used slots).
+func flattenBatch(seqs []SeqForward) (tokens, nTokens, pos, tables []int32, mbps int) {
+	nTokens = make([]int32, len(seqs))
+	pos = make([]int32, len(seqs))
+	for i, s := range seqs {
+		tokens = append(tokens, s.Tokens...)
+		nTokens[i] = int32(len(s.Tokens))
+		pos[i] = int32(s.Pos)
+		if len(s.BlockTable) > mbps {
+			mbps = len(s.BlockTable)
+		}
+	}
+	tables = make([]int32, len(seqs)*mbps)
+	for i := range tables {
+		tables[i] = -1
+	}
+	for i, s := range seqs {
+		copy(tables[i*mbps:], s.BlockTable)
+	}
+	return tokens, nTokens, pos, tables, mbps
+}
+
+func cstrlen(b []byte) int {
+	for i, c := range b {
+		if c == 0 {
+			return i
+		}
+	}
+	return len(b)
+}

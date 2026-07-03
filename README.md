@@ -6,15 +6,22 @@ C++** does everything on the GPU (kernels, memory, the forward step, cuBLAS/
 CUTLASS, CUDA graphs). The two meet at a deliberately narrow C-ABI
 ([backend/shim.h](backend/shim.h)). Full plan: [docs/PLAN.md](docs/PLAN.md).
 
-## Status
+## Status — Phases 0-5 complete (see [docs/JOURNAL.md](docs/JOURNAL.md))
 
-- [x] Walking skeleton: Go → shared lib → CUDA context → kernel launch →
-      results verified in Go (`cmd/smoke`)
-- [x] Safetensors loader (single-file + sharded index) with tests; `cmd/inspect`
-- [x] Tiny 2-layer Llama-style test model generator
-      (`tools/make_test_model.py`, driven by raw token ids — no tokenizer)
-- [ ] Phase 0 remainder: weight upload, cuBLAS forward pass, greedy decode
-      matching `gen_reference.py` dumps; then tokenizer + sub-1B model
+- [x] Phase 0: fp32 forward pass matches HF exactly (tokens, logits,
+      per-layer activations) via the offline oracle (`tools/gen_reference.py`)
+- [x] Phase 1: fused add+RMSNorm kernel, bench harness, roofline note
+- [x] Phase 2: paged KV — Go block allocator, stateless batched forward
+- [x] Phase 3: continuous batching scheduler + HTTP/SSE server
+      (1.1K → 23K tok/s scaling on the lab GPU)
+- [x] Phase 4: W4 group-quant weights + dequant-fused matmul, validated
+      against HF running on the dequantized twin checkpoint
+- [x] Phase 5: MoE — softmax top-k (Mixtral-style, HF-validated) AND
+      sigmoid+expert-bias (Sarvam/DSv3 family) routing; INT4 experts
+- [x] Modal A10G gate: full suite green on Linux/cgo/sm_86
+- [ ] Kernel optimization (the deliberate endgame): W4 matmul, paged
+      attention, fused grouped-GEMM, CUDA graphs — baselines in the journal
+- [ ] 30B checkpoints (bf16 path + tokenizer) on Modal A10G/A100
 
 ## Layout
 

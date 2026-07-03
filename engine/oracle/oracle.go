@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"kllm/engine"
@@ -31,11 +32,21 @@ func RepoPath(parts ...string) string {
 	return filepath.Join(append([]string{"..", ".."}, parts...)...)
 }
 
+// BackendLib returns the platform's built backend library path. On Linux the
+// cgo loader links it at build time and ignores the path, but its presence
+// still gates whether GPU tests can run.
+func BackendLib() string {
+	if runtime.GOOS == "windows" {
+		return RepoPath("build", "toyengine_backend.dll")
+	}
+	return RepoPath("build", "libtoyengine.so")
+}
+
 // Run loads modelDir and validates it against dumpsDir. Skips if artifacts
 // are missing; fails on any divergence beyond the tolerances.
 func Run(t *testing.T, modelDir, dumpsDir string, layerTol, logitsTol float64) {
 	t.Helper()
-	dll := RepoPath("build", "toyengine_backend.dll")
+	dll := BackendLib()
 	for _, p := range []string{dll, modelDir, dumpsDir} {
 		if _, err := os.Stat(p); err != nil {
 			t.Skipf("missing %s — build the DLL and generate the test model + dumps first", p)

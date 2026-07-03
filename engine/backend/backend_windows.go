@@ -128,26 +128,7 @@ func (w *winImpl) finalize() error {
 }
 
 func (w *winImpl) forwardBatch(seqs []SeqForward, logits []float32) error {
-	// Flatten the batch into the C-ABI's parallel arrays.
-	var tokens []int32
-	nTokens := make([]int32, len(seqs))
-	pos := make([]int32, len(seqs))
-	mbps := 0
-	for i, s := range seqs {
-		tokens = append(tokens, s.Tokens...)
-		nTokens[i] = int32(len(s.Tokens))
-		pos[i] = int32(s.Pos)
-		if len(s.BlockTable) > mbps {
-			mbps = len(s.BlockTable)
-		}
-	}
-	tables := make([]int32, len(seqs)*mbps)
-	for i := range tables {
-		tables[i] = -1 // unreachable entries; backend validates only used slots
-	}
-	for i, s := range seqs {
-		copy(tables[i*mbps:], s.BlockTable)
-	}
+	tokens, nTokens, pos, tables, mbps := flattenBatch(seqs)
 
 	rc, _, _ := w.procForwardBatch.Call(
 		uintptr(len(seqs)),
@@ -245,11 +226,3 @@ func (w *winImpl) smokeVectorAdd(a, b []float32) ([]float32, error) {
 
 func (w *winImpl) close() error { return w.dll.Release() }
 
-func cstrlen(b []byte) int {
-	for i, c := range b {
-		if c == 0 {
-			return i
-		}
-	}
-	return len(b)
-}

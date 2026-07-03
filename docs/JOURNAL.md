@@ -251,6 +251,46 @@ Correctness harness refactored into `engine/oracle` (shared by the four
 model-variant suites; each variant is its own test package because the
 backend allows one model per process).
 
+## Modal A10G gate — DONE (Linux cgo + real Ampere, first run green)
+
+`engine/backend/backend_cgo.go` (build-tagged linux) links
+`libtoyengine.so` via cgo — same `impl` interface as the Windows syscall
+loader, batch flattening shared in `backend.go`. `modal run
+tools/modal_lab.py::build_and_test` ships the repo (incl. test models +
+refdumps) into the CUDA 12.8 container, builds the backend `-arch=sm_86`,
+and runs everything on an **A10 (sm_86, 22 GiB, 72 SMs)**:
+
+- All 7 test packages pass, first run: dense-vs-HF, paged batch, scheduler,
+  W4-vs-dequant, MoE softmax-vs-HF, MoE sigmoid-vs-numpy, INT4-MoE.
+- Smoke: max abs error 0. wbench on A10: cuBLAS fp32 at ~500 GB/s;
+  naive W4 kernel 13-35 GB/s effective (0.20-0.53x) — same optimization
+  target, now measured on the real target architecture.
+
+The engine is now proven portable: Windows/syscall/sm_75 for the inner loop,
+Linux/cgo/sm_86 for the target. Gotcha for the record: Modal image `.env()`
+does not expand `$PATH` — set the full explicit PATH or lose /usr/bin.
+
+## What remains — kernel optimization (the deliberate endgame)
+
+Phases 0-5 are complete and gated. The system is done; the kernels are
+naive on purpose. The optimization backlog, each with a measured baseline
+and a correctness net that will catch any regression:
+
+1. **W4 dequant-matmul** (biggest lever): coalesce Q access, stage X in
+   shared memory, warp-level reduction, k-split for n=1 occupancy. Target:
+   beat cuBLAS fp32 by ~4-8x in bytes terms (A10 baseline: 0.2x).
+2. **Paged attention**: one thread per (token, head) → warp/block per query
+   with shared-mem K/V tiles and online softmax (FA2-style, GQA-aware).
+3. **Fused grouped-GEMM MoE**: kill the per-layer host round-trip (device
+   prefix-sum permutation), single grouped kernel over expert segments.
+4. **CUDA graphs**: capture the decode step, replay per step — the
+   launch-overhead fix the Phase 1 roofline note predicted.
+5. `ncu` on this box (and Modal for sm_86 numbers) drives all of it.
+
+30B-class checkpoints (Gemma/Qwen/Sarvam) become a loader exercise
+(bf16→fp32 conversion or an fp16 compute path, sharded index already
+supported) + Modal A10G/A100 for VRAM — no new engine architecture.
+
 ## Phase 0 — original goals
 
 Goal: Go greedy-decodes `testmodels/tiny-llama` (2-layer, hidden 64, GQA 4/2,

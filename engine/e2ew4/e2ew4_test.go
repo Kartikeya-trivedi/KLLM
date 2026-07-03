@@ -15,6 +15,7 @@ import (
 
 	"kllm/engine"
 	"kllm/engine/npy"
+	"kllm/engine/oracle"
 )
 
 const (
@@ -32,7 +33,7 @@ func repoPath(parts ...string) string {
 }
 
 func TestW4MatchesDequantReference(t *testing.T) {
-	dll := repoPath("build", "toyengine_backend.dll")
+	dll := oracle.BackendLib()
 	model := repoPath("testmodels", "tiny-llama-w4")
 	dumps := repoPath("refdumps", "tiny-llama-w4dq")
 	for _, p := range []string{dll, model, dumps} {
