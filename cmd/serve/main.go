@@ -22,15 +22,16 @@ func main() {
 	maxSeq := flag.Int64("max-seq", 512, "per-sequence KV capacity")
 	numBlocks := flag.Int("kv-blocks", 0, "KV pool blocks (0 = default)")
 	maxBatch := flag.Int("max-batch", 16, "max sequences per forward step")
+	nodeID := flag.String("node-id", "kllm", "id this server reports when answering as a cluster node (/v1/infer)")
 	flag.Parse()
 
-	if err := run(*dllPath, *modelDir, *device, *addr, *maxSeq, *numBlocks, *maxBatch); err != nil {
+	if err := run(*dllPath, *modelDir, *device, *addr, *maxSeq, *numBlocks, *maxBatch, *nodeID); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
-func run(dllPath, modelDir string, device int, addr string, maxSeq int64, numBlocks, maxBatch int) error {
+func run(dllPath, modelDir string, device int, addr string, maxSeq int64, numBlocks, maxBatch int, nodeID string) error {
 	e, err := engine.New(dllPath, modelDir, engine.Options{
 		Device: device, MaxSeq: maxSeq, NumBlocks: numBlocks,
 	})
@@ -46,5 +47,5 @@ func run(dllPath, modelDir string, device int, addr string, maxSeq int64, numBlo
 	info, _ := e.B.DeviceInfo()
 	fmt.Printf("serving %s on http://%s (device: %s, max batch %d)\n",
 		modelDir, addr, info, maxBatch)
-	return http.ListenAndServe(addr, server.Handler(sched))
+	return http.ListenAndServe(addr, server.HandlerAs(sched, server.Identity{Node: nodeID, Model: modelDir}))
 }

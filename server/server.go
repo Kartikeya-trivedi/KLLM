@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 
+	"kllm/cluster"
 	"kllm/engine"
 )
 
@@ -27,8 +29,57 @@ type errorEvent struct {
 	Error string `json:"error"`
 }
 
+// Identity is how this server names itself when it answers as a cluster node.
+type Identity struct {
+	Node  string // node id reported in /v1/infer responses
+	Model string // what is being served, for logs and datasets
+}
+
 func Handler(s *engine.Scheduler) http.Handler {
+	return HandlerAs(s, Identity{Node: "kllm"})
+}
+
+// HandlerAs is Handler with an explicit cluster identity.
+func HandlerAs(s *engine.Scheduler, id Identity) http.Handler {
 	mux := http.NewServeMux()
+
+	// POST /v1/infer — the cluster node protocol (see kllm/cluster): one
+	// JSON request, one JSON response carrying the whole continuation and
+	// the probability the model put on each token. This is what makes a
+	// plain `kllm serve` an (honest) node the orchestrator can fan out to.
+	mux.HandleFunc("POST /v1/infer", func(w http.ResponseWriter, r *http.Request) {
+		var req cluster.Request
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.MaxNewTokens <= 0 {
+			req.MaxNewTokens = 64
+		}
+		start := time.Now()
+		resp := cluster.Response{RequestID: req.ID, Node: id.Node, Model: id.Model}
+		status := http.StatusOK
+		events, err := s.SubmitConf(req.Prompt, req.MaxNewTokens)
+		if err != nil {
+			resp.Err, status = err.Error(), http.StatusServiceUnavailable
+		} else {
+			for ev := range events {
+				if ev.Err != nil {
+					resp.Err, status = ev.Err.Error(), http.StatusInternalServerError
+					resp.Tokens, resp.Conf = nil, nil
+					break
+				}
+				if !ev.Done {
+					resp.Tokens = append(resp.Tokens, ev.Token)
+					resp.Conf = append(resp.Conf, ev.Prob)
+				}
+			}
+		}
+		resp.LatencyMs = float64(time.Since(start)) / float64(time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		json.NewEncoder(w).Encode(resp)
+	})
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "ok")

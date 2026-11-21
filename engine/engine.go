@@ -4,6 +4,7 @@ package engine
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"kllm/engine/backend"
@@ -221,6 +222,19 @@ func Argmax(logits []float32) int32 {
 		}
 	}
 	return int32(best)
+}
+
+// ArgmaxProb is Argmax plus the softmax probability of the winning token —
+// the model's confidence in its greedy choice. It costs one exp per vocab
+// entry, so the scheduler only computes it for requests that ask.
+func ArgmaxProb(logits []float32) (int32, float32) {
+	best := Argmax(logits)
+	top := float64(logits[best])
+	var z float64
+	for _, v := range logits {
+		z += math.Exp(float64(v) - top)
+	}
+	return best, float32(1 / z)
 }
 
 func (e *Engine) Close() error { return e.B.Close() }

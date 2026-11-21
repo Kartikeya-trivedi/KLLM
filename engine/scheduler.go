@@ -11,6 +11,7 @@ import (
 // GenEvent is one streamed generation event.
 type GenEvent struct {
 	Token int32
+	Prob  float32 // softmax probability of Token; set only for SubmitConf requests
 	Err   error
 	Done  bool
 }
@@ -21,6 +22,7 @@ type reqState struct {
 	out       chan GenEvent
 	seq       *Sequence
 	prefilled bool
+	wantProb  bool  // also report each token's probability
 	next      int32 // pending token to feed (after prefill)
 	generated int
 
@@ -61,6 +63,18 @@ func (s *Scheduler) Metrics() *metrics.Metrics { return s.m }
 // per token and closes after Done (buffered: the scheduler never blocks on a
 // slow consumer).
 func (s *Scheduler) Submit(prompt []int32, maxNew int) (<-chan GenEvent, error) {
+	return s.submit(prompt, maxNew, false)
+}
+
+// SubmitConf is Submit with each event carrying the probability the model
+// put on its token (GenEvent.Prob). The cluster layer uses it as the node's
+// self-reported confidence; it costs a softmax over the vocabulary per
+// token, which is why plain Submit skips it.
+func (s *Scheduler) SubmitConf(prompt []int32, maxNew int) (<-chan GenEvent, error) {
+	return s.submit(prompt, maxNew, true)
+}
+
+func (s *Scheduler) submit(prompt []int32, maxNew int, wantProb bool) (<-chan GenEvent, error) {
 	if len(prompt) == 0 || maxNew <= 0 {
 		return nil, fmt.Errorf("scheduler: empty prompt or non-positive maxNew")
 	}
@@ -72,6 +86,7 @@ func (s *Scheduler) Submit(prompt []int32, maxNew int) (<-chan GenEvent, error) 
 		prompt:   prompt,
 		maxNew:   maxNew,
 		out:      make(chan GenEvent, maxNew+1),
+		wantProb: wantProb,
 		submitAt: time.Now(),
 	}
 	select {
@@ -211,7 +226,13 @@ func (s *Scheduler) run() {
 			wasPrefill := !r.prefilled
 			r.seq.Commit(len(batch[i].Tokens))
 			r.prefilled = true
-			tok := Argmax(logits[i])
+			var tok int32
+			var prob float32
+			if r.wantProb {
+				tok, prob = ArgmaxProb(logits[i])
+			} else {
+				tok = Argmax(logits[i])
+			}
 			r.next = tok
 			r.generated++
 
@@ -224,7 +245,7 @@ func (s *Scheduler) run() {
 			}
 			r.lastTokAt = now
 
-			r.out <- GenEvent{Token: tok}
+			r.out <- GenEvent{Token: tok, Prob: prob}
 			eos := s.e.Cfg.EOSTokenID >= 0 && int64(tok) == s.e.Cfg.EOSTokenID
 			if eos || r.generated >= r.maxNew {
 				finish(r)
