@@ -103,8 +103,10 @@ func (n *Node) Infer(ctx context.Context, req cluster.Request) cluster.Response 
 		err = sleep(ctx, out.Latency)
 	}
 	elapsed := time.Since(start)
-	if !n.cfg.Realtime {
-		elapsed += out.Latency
+	if !n.cfg.Realtime && out.Latency > 0 {
+		// Virtual time: report exactly the modelled figure, so a dataset
+		// does not depend on how busy the machine generating it was.
+		elapsed = out.Latency
 	}
 	resp.LatencyMs = float64(elapsed) / float64(time.Millisecond)
 	if n.cfg.Labels {

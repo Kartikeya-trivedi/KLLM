@@ -200,7 +200,7 @@ func (b *faulty) Generate(ctx context.Context, req cluster.Request) (Output, err
 	delay := time.Duration(b.f.DelayMs * float64(time.Millisecond))
 
 	if strike && b.f.Kind == FaultCrash {
-		return Output{Label: label}, ErrCrashed
+		return Output{Label: label, Latency: fastLatency + delay}, ErrCrashed // a refused connection fails fast
 	}
 
 	// An adversary that fabricates the whole answer need not run the model.

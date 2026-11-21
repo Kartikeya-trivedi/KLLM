@@ -21,6 +21,7 @@ import (
 	"kllm/cluster"
 	"kllm/cluster/node"
 	"kllm/cluster/orchestrator"
+	"kllm/cluster/record"
 )
 
 func main() {
@@ -33,6 +34,9 @@ func main() {
 	order := flag.String("order", "hash", "who is asked first when not everyone is: hash | trust")
 	timeout := flag.Duration("timeout", 2*time.Second, "per-request deadline for node calls")
 	health := flag.Duration("health-every", 2*time.Second, "node health-probe interval")
+	logPath := flag.String("log", "", "append every request (all node responses) to this JSONL file")
+	metricsPath := flag.String("metrics-log", "", "sample every node's stats into this JSONL file")
+	metricsEvery := flag.Duration("metrics-every", 5*time.Second, "system-metrics sampling interval")
 	flag.Parse()
 
 	opts := orchestrator.Options{
@@ -42,17 +46,30 @@ func main() {
 		},
 		HealthEvery: *health,
 	}
-	if err := run(*addr, *nodes, opts); err != nil {
+	if err := run(*addr, *nodes, opts, *logPath, *metricsPath, *metricsEvery); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
-func run(addr, nodes string, opts orchestrator.Options) error {
+func run(addr, nodes string, opts orchestrator.Options, logPath, metricsPath string, metricsEvery time.Duration) error {
 	switch opts.Policy.Mode {
 	case cluster.ModeAll, cluster.ModeFirstK, cluster.ModeAdaptive:
 	default:
 		return fmt.Errorf("unknown policy %q", opts.Policy.Mode)
+	}
+	if logPath != "" {
+		w, err := record.Create(logPath)
+		if err != nil {
+			return err
+		}
+		defer w.Close()
+		seq := 0
+		opts.Sink = func(res orchestrator.Result) { // serialised by the orchestrator
+			w.Write(record.FromResult(res, seq, time.Now()))
+			w.Flush()
+			seq++
+		}
 	}
 	o := orchestrator.New(opts)
 	for _, pair := range strings.Split(nodes, ",") {
@@ -69,6 +86,15 @@ func run(addr, nodes string, opts orchestrator.Options) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	go o.Run(ctx)
+	if metricsPath != "" {
+		w, err := record.Create(metricsPath)
+		if err != nil {
+			return err
+		}
+		sampled := make(chan struct{})
+		go func() { record.RunSampler(ctx, metricsEvery, o.Stats, w); close(sampled) }()
+		defer func() { stop(); <-sampled; w.Close() }() // stop first: the sampler exits on ctx
+	}
 
 	srv := &http.Server{Addr: addr, Handler: o.Handler()}
 	go func() {
