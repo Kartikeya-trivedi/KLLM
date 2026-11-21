@@ -7,3 +7,4 @@ testmodels/
 *.exp
 *.exe
 __pycache__/
+data/
