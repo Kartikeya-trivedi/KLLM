@@ -64,6 +64,59 @@ func (h *Histogram) Snapshot() (count uint64, sum, mean float64) {
 	return h.total, h.sum, mean
 }
 
+// Quantile estimates the q-quantile (0..1) by linear interpolation inside
+// the bucket it falls in. Observations past the last bound report that
+// bound, so pick bounds that cover the range you care about.
+func (h *Histogram) Quantile(q float64) float64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.total == 0 {
+		return 0
+	}
+	rank := q * float64(h.total)
+	var cum float64
+	for i, c := range h.counts {
+		if cum+float64(c) >= rank && c > 0 {
+			if i >= len(h.bounds) {
+				return h.bounds[len(h.bounds)-1]
+			}
+			lo := 0.0
+			if i > 0 {
+				lo = h.bounds[i-1]
+			}
+			return lo + (h.bounds[i]-lo)*(rank-cum)/float64(c)
+		}
+		cum += float64(c)
+	}
+	return h.bounds[len(h.bounds)-1]
+}
+
+// WriteCounter, WriteGauge and Histogram.WriteProm render one instrument in
+// Prometheus text-exposition format. They are exported so other servers in
+// the tree (the cluster's nodes and orchestrator) expose metrics the same
+// way the engine does.
+func WriteCounter(w io.Writer, name, help string, v uint64) {
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %d\n", name, help, name, name, v)
+}
+
+func WriteGauge(w io.Writer, name, help string, v float64) {
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %g\n", name, help, name, name, v)
+}
+
+func (h *Histogram) WriteProm(w io.Writer, name, help string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s histogram\n", name, help, name)
+	var cum uint64
+	for i, b := range h.bounds {
+		cum += h.counts[i]
+		fmt.Fprintf(w, "%s_bucket{le=\"%g\"} %d\n", name, b, cum)
+	}
+	cum += h.counts[len(h.bounds)]
+	fmt.Fprintf(w, "%s_bucket{le=\"+Inf\"} %d\n", name, cum)
+	fmt.Fprintf(w, "%s_sum %g\n%s_count %d\n", name, h.sum, name, h.total)
+}
+
 // Metrics is the engine's fixed set of instruments.
 type Metrics struct {
 	RequestsTotal Counter // requests admitted
@@ -108,25 +161,9 @@ func (m *Metrics) UpdateTokPerSec(tokens int, seconds float64) {
 
 // WriteProm renders all metrics in Prometheus text-exposition format.
 func (m *Metrics) WriteProm(w io.Writer) {
-	counter := func(name, help string, v uint64) {
-		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %d\n", name, help, name, name, v)
-	}
-	gauge := func(name, help string, v float64) {
-		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %g\n", name, help, name, name, v)
-	}
-	hist := func(name, help string, h *Histogram) {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s histogram\n", name, help, name)
-		var cum uint64
-		for i, b := range h.bounds {
-			cum += h.counts[i]
-			fmt.Fprintf(w, "%s_bucket{le=\"%g\"} %d\n", name, b, cum)
-		}
-		cum += h.counts[len(h.bounds)]
-		fmt.Fprintf(w, "%s_bucket{le=\"+Inf\"} %d\n", name, cum)
-		fmt.Fprintf(w, "%s_sum %g\n%s_count %d\n", name, h.sum, name, h.total)
-	}
+	counter := func(name, help string, v uint64) { WriteCounter(w, name, help, v) }
+	gauge := func(name, help string, v float64) { WriteGauge(w, name, help, v) }
+	hist := func(name, help string, h *Histogram) { h.WriteProm(w, name, help) }
 
 	counter("kllm_requests_total", "Requests admitted.", m.RequestsTotal.Value())
 	counter("kllm_requests_done_total", "Requests finished.", m.RequestsDone.Value())

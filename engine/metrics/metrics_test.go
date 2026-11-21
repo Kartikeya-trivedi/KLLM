@@ -29,6 +29,29 @@ func TestHistogramBuckets(t *testing.T) {
 	}
 }
 
+func TestHistogramQuantile(t *testing.T) {
+	h := NewHistogram([]float64{10, 20, 40})
+	if h.Quantile(0.5) != 0 {
+		t.Fatal("empty histogram should report 0")
+	}
+	for range 50 {
+		h.Observe(5) // bucket (0,10]
+	}
+	for range 50 {
+		h.Observe(15) // bucket (10,20]
+	}
+	if got := h.Quantile(0.5); got < 9 || got > 11 {
+		t.Fatalf("median = %v, want ~10", got)
+	}
+	if got := h.Quantile(0.75); got < 14 || got > 16 {
+		t.Fatalf("p75 = %v, want ~15", got)
+	}
+	h.Observe(1000) // past the last bound: clamps
+	if got := h.Quantile(1); got != 40 {
+		t.Fatalf("max = %v, want the last bound 40", got)
+	}
+}
+
 func TestEWMAThroughput(t *testing.T) {
 	m := New()
 	m.UpdateTokPerSec(0, 1)   // ignored
