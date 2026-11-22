@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"kllm/cluster"
+	"kllm/cluster/aggregate"
 	"kllm/cluster/node"
 	"kllm/cluster/orchestrator"
 	"kllm/cluster/record"
@@ -34,6 +35,7 @@ func main() {
 	order := flag.String("order", "hash", "who is asked first when not everyone is: hash | trust")
 	timeout := flag.Duration("timeout", 2*time.Second, "per-request deadline for node calls")
 	health := flag.Duration("health-every", 2*time.Second, "node health-probe interval")
+	aggName := flag.String("aggregator", "majority", "how answers are combined: none | "+strings.Join(aggregate.Names(), " | "))
 	logPath := flag.String("log", "", "append every request (all node responses) to this JSONL file")
 	metricsPath := flag.String("metrics-log", "", "sample every node's stats into this JSONL file")
 	metricsEvery := flag.Duration("metrics-every", 5*time.Second, "system-metrics sampling interval")
@@ -45,6 +47,14 @@ func main() {
 			TimeoutMs: float64(*timeout) / float64(time.Millisecond),
 		},
 		HealthEvery: *health,
+	}
+	if *aggName != "none" { // "none" collects every response and decides nothing
+		agg, err := aggregate.New(*aggName)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		opts.Aggregator = agg
 	}
 	if err := run(*addr, *nodes, opts, *logPath, *metricsPath, *metricsEvery); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
