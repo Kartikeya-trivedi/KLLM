@@ -3,9 +3,11 @@
 //
 // With no --data it runs the standard sweep — every attack at every
 // adversary count, generated in the lab — and writes results.csv,
-// detection.csv, report.md and sweep.json:
+// detection.csv, report.md and sweep.json. Run with no flags it reproduces
+// the files checked in under bench/robustness (7 nodes, 1000 requests,
+// 5 seeds):
 //
-//	robusteval --out bench/robustness
+//	robusteval
 //
 // With --data it scores an existing request log (from cmd/datagen or a
 // live orchestrator's --log, provided it carries references and was
@@ -33,7 +35,7 @@ func main() {
 	nodes := flag.Int("nodes", 7, "cluster size")
 	maxAdv := flag.Int("max-adversaries", 0, "largest adversary count (default: a bare majority, to show where methods break)")
 	requests := flag.Int("requests", 1000, "requests per condition, per seed")
-	seeds := flag.Int("seeds", 3, "independent repetitions (models, workloads, clusters) to pool")
+	seeds := flag.Int("seeds", 5, "independent repetitions (models, workloads, clusters) to pool")
 	attacks := flag.String("attacks", "", "comma-separated attacks (default: all of "+strings.Join(dataset.Attacks, ",")+")")
 	out := flag.String("out", "bench/robustness", "output directory for the sweep")
 	data := flag.String("data", "", "score this request log instead of running the sweep")
@@ -133,6 +135,8 @@ func score(path string, nodes int) error {
 		fmt.Printf("%-28s %6.1f%% %6.1f%% %7.1f%% %7.1f%% %8.0f %8.0f %7.2f %9.1f\n", x.Method,
 			100*x.ExactMatch, 100*x.CI95, 100*x.Coverage, 100*x.AttackSuccess, x.LatencyP50, x.LatencyP99, x.NodeCalls, x.Tokens)
 	}
+	fmt.Println("\n+/- is the binomial interval of this one run. It does not cover run-to-run variation, which for the")
+	fmt.Println("strategies that learn is the larger effect; a sweep reports that as em_ci95 and em_seed_min / em_seed_max.")
 	d := eval.Detect(recs)
 	fmt.Printf("\ndetection   tampered responses: P %.1f%% R %.1f%% (stateless)  P %.1f%% R %.1f%% (with memory)\n",
 		100*d.RespPrecision, 100*d.RespRecall, 100*d.SuspPrecision, 100*d.SuspRecall)

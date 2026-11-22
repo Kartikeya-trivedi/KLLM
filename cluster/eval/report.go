@@ -74,6 +74,13 @@ func (r Report) Markdown() string {
 	fmt.Fprintf(&b, "## Robustness summary\n\n")
 	fmt.Fprintf(&b, "Worst case over all attacks at each adversary count, and the attack responsible. ")
 	fmt.Fprintf(&b, "Breakdown is the smallest adversary count at which some attack takes exact match below 50%%.\n\n")
+	fmt.Fprintf(&b, "A figure in square brackets is that cell's worst single seed, shown where it is more than 5 points below the pooled figure. ")
+	fmt.Fprintf(&b, "There the pooled number is an average of runs that held and runs that did not, and which attack shows the lowest one is largely the luck of the seeds. ")
+	if len(s.Seeds) > 1 {
+		fmt.Fprintf(&b, "`em_ci95` in results.csv is computed from the spread between seeds for the same reason.\n\n")
+	} else {
+		fmt.Fprintf(&b, "This sweep has a single seed, so `em_ci95` in results.csv is only that run's binomial interval: it says nothing about run-to-run variation, and a captured run reads as certain.\n\n")
+	}
 	header := []string{"strategy", "clean"}
 	for f := 1; f <= s.MaxAdversaries; f++ {
 		header = append(header, fmt.Sprintf("worst f=%d", f))
@@ -83,7 +90,11 @@ func (r Report) Markdown() string {
 	for _, rb := range r.Robustness() {
 		row := []string{rb.Method, pct(rb.Clean)}
 		for i, w := range rb.Worst {
-			row = append(row, fmt.Sprintf("%s (%s)", pct(w), rb.Hard[i]))
+			c := fmt.Sprintf("%s (%s)", pct(w), rb.Hard[i])
+			if w-rb.WorstSeed[i] > 0.05 {
+				c += fmt.Sprintf(" [%s]", pct(rb.WorstSeed[i]))
+			}
+			row = append(row, c)
 		}
 		bd := fmt.Sprintf("> %d", s.MaxAdversaries)
 		if rb.Breakdown > 0 {

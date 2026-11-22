@@ -22,7 +22,7 @@ type Sweep struct {
 
 // WithDefaults fills unset fields: 7 nodes, adversaries up to a bare
 // majority (so the tables show where each method breaks, not just that it
-// holds), 1000 requests, 3 seeds, every attack, every method.
+// holds), 1000 requests, 5 seeds, every attack, every method.
 func (s Sweep) WithDefaults() Sweep {
 	if s.Nodes <= 0 {
 		s.Nodes = 7
@@ -35,7 +35,7 @@ func (s Sweep) WithDefaults() Sweep {
 		s.Requests = 1000
 	}
 	if len(s.Seeds) == 0 {
-		s.Seeds = []uint64{1, 2, 3}
+		s.Seeds = []uint64{1, 2, 3, 4, 5}
 	}
 	if len(s.Attacks) == 0 {
 		s.Attacks = dataset.Attacks
@@ -161,6 +161,12 @@ type Robustness struct {
 	Worst  []float64 // Worst[f-1]: lowest exact match over all attacks with f adversaries
 	Hard   []string  // Hard[f-1]: the attack that achieved it
 
+	// WorstSeed[f-1] is the lowest exact match of any single seed in that
+	// cell. Where it sits far below Worst, the pooled figure is an average
+	// of runs that held and runs that were captured, and which attack
+	// shows the lowest one is largely the luck of the seeds.
+	WorstSeed []float64
+
 	// Breakdown is the smallest adversary count at which some attack
 	// pushes exact match below one half; 0 if none in the sweep does.
 	Breakdown int
@@ -178,13 +184,13 @@ func (r Report) Robustness() []Robustness {
 			rb.Clean = c.ExactMatch
 		}
 		for f := 1; f <= r.Sweep.MaxAdversaries; f++ {
-			worst, hard := 2.0, ""
+			worst, seed, hard := 2.0, 0.0, ""
 			for _, a := range r.Sweep.Attacks {
 				if c, ok := r.Get(a, f, rb.Method); ok && c.ExactMatch < worst {
-					worst, hard = c.ExactMatch, a
+					worst, seed, hard = c.ExactMatch, c.SeedMin, a
 				}
 			}
-			rb.Worst, rb.Hard = append(rb.Worst, worst), append(rb.Hard, hard)
+			rb.Worst, rb.Hard, rb.WorstSeed = append(rb.Worst, worst), append(rb.Hard, hard), append(rb.WorstSeed, seed)
 			if worst < 0.5 && rb.Breakdown == 0 {
 				rb.Breakdown = f
 			}

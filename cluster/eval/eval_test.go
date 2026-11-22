@@ -90,6 +90,77 @@ func TestMetricsOnAKnownLog(t *testing.T) {
 	}
 }
 
+// Pooling runs must not hide that they disagreed. A strategy that learns
+// is right or wrong for a whole run at a time, so the interval has to come
+// from the spread between runs, not from the pooled request count.
+func TestIntervalReflectsTheSpreadBetweenRuns(t *testing.T) {
+	ref, lie := []int32{1, 2, 3, 4}, []int32{9, 9, 9, 9}
+	run := func(right, wrong int) []record.Record {
+		recs := make([]record.Record, 0, right+wrong)
+		for i := 0; i < right+wrong; i++ {
+			tokens := ref
+			if i >= right {
+				tokens = lie
+			}
+			recs = append(recs, record.Record{Request: cluster.Request{ID: "r"}, Reference: ref, Responses: []cluster.Response{
+				{Node: "a", Tokens: tokens, Label: &cluster.Label{Fault: "none"}},
+				{Node: "b", Tokens: tokens, Label: &cluster.Label{Fault: "none"}},
+				{Node: "c", Tokens: tokens, Label: &cluster.Label{Fault: "none"}},
+			}})
+		}
+		return recs
+	}
+	m := Method{Aggregator: "majority"}
+	pool := func(runs ...[]record.Record) Metrics {
+		var s score
+		for _, recs := range runs {
+			if err := s.replay(recs, m); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return s.metrics(m)
+	}
+
+	// One run right throughout, one wrong throughout: 50% pooled, and
+	// nothing like +/- 3 points.
+	split := pool(run(500, 0), run(0, 500))
+	binomial := 1.96 * math.Sqrt(0.25/1000)
+	if split.ExactMatch != 0.5 || split.SeedMin != 0 || split.SeedMax != 1 {
+		t.Fatalf("pooled %g, seeds %g..%g", split.ExactMatch, split.SeedMin, split.SeedMax)
+	}
+	// Two runs at 0 and 1: standard error 0.5, and t with one degree of freedom is 12.706.
+	if want := 12.706 * 0.5; math.Abs(split.CI95-want) > 1e-9 {
+		t.Fatalf("ci95 %g, want %g (the binomial interval would have said %g)", split.CI95, want, binomial)
+	}
+
+	// Five runs, one of them captured: the interval is still wide enough
+	// to say so.
+	captured := pool(run(990, 10), run(990, 10), run(990, 10), run(990, 10), run(0, 1000))
+	if captured.ExactMatch != 0.792 || captured.CI95 < 0.5 {
+		t.Fatalf("one captured run in five: pooled %g +/- %g", captured.ExactMatch, captured.CI95)
+	}
+
+	// Runs that agree exactly have no spread; the pooled count is the floor.
+	same := pool(run(100, 100), run(100, 100), run(100, 100))
+	if want := 1.96 * math.Sqrt(0.25/600); math.Abs(same.CI95-want) > 1e-12 {
+		t.Fatalf("ci95 %g, want the binomial floor %g", same.CI95, want)
+	}
+
+	if tCritical(4) != 2.776 || ci95(0.5, 0, nil) != 0 {
+		t.Fatalf("t(4)=%g empty=%g", tCritical(4), ci95(0.5, 0, nil))
+	}
+	// Past the table the value keeps falling smoothly towards 1.96; it does
+	// not drop to it. Reference values: 2.0395 at 31, 2.0003 at 60, 1.9840 at 100.
+	for df, want := range map[int]float64{31: 2.0395, 60: 2.0003, 100: 1.9840, 100000: 1.96} {
+		if got := tCritical(df); math.Abs(got-want) > 5e-4 {
+			t.Errorf("t(%d) = %.4f, want %.4f", df, got, want)
+		}
+	}
+	if tCritical(31) >= tCritical(30) || tCritical(32) >= tCritical(31) {
+		t.Errorf("t is not decreasing across the end of the table: %g, %g, %g", tCritical(30), tCritical(31), tCritical(32))
+	}
+}
+
 func TestMethodNames(t *testing.T) {
 	for m, want := range map[Method]string{
 		{Aggregator: "majority"}: "majority",

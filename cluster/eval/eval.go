@@ -52,7 +52,12 @@ type Metrics struct {
 	// Accuracy. An abstention is not a correct answer, so it counts
 	// against ExactMatch; Coverage and Selective separate the two effects.
 	ExactMatch float64 `csv:"exact_match" json:"exact_match"` // answers identical to the reference
-	CI95       float64 `csv:"em_ci95" json:"em_ci95"`         // half-width of a 95% interval on ExactMatch
+
+	// CI95 is the half-width of a 95% interval on ExactMatch. Across
+	// several seeds it is taken from the spread between them, not from the
+	// pooled request count: requests within a run are not independent
+	// draws (see ci95).
+	CI95 float64 `csv:"em_ci95" json:"em_ci95"`
 
 	// The lowest and highest ExactMatch of any single seed. Pooling hides
 	// the difference between "80% everywhere" and "100% on four runs, 0%
@@ -174,13 +179,59 @@ func (s *score) metrics(m Method) Metrics {
 		NodeCalls:     ratio(s.calls, n), Tokens: ratio(s.tokens, n),
 		TokensPerCorrect: ratio(s.tokens, float64(s.exact)),
 	}
-	if s.n > 0 { // normal approximation; fine at the sample sizes used here
-		out.CI95 = 1.96 * math.Sqrt(em*(1-em)/n)
-	}
+	out.CI95 = ci95(em, s.n, s.perSeed)
 	if len(s.perSeed) > 0 {
 		out.SeedMin, out.SeedMax = cluster.Percentile(s.perSeed, 0), cluster.Percentile(s.perSeed, 1)
 	}
 	return out
+}
+
+// ci95 is the half-width of a 95% interval on an exact-match rate em
+// measured over n requests, given the rate of each run that was pooled.
+//
+// One run can only offer the binomial interval of its own count, which
+// treats its requests as independent draws. They are not. A strategy that
+// learns is right or wrong for a whole run at a time — captured on one
+// seed, fine on the next — and each seed is a different model, workload
+// and cluster besides. So with several runs the interval is a t interval
+// on the per-run rates, which measures exactly that run-to-run spread. It
+// is never reported narrower than the binomial one: a handful of runs can
+// agree by luck, and the pooled count is still a floor on the noise.
+func ci95(em float64, n int, perRun []float64) float64 {
+	if n == 0 {
+		return 0
+	}
+	half := 1.96 * math.Sqrt(em*(1-em)/float64(n)) // normal approximation; fine at these sample sizes
+	if k := len(perRun); k > 1 {
+		mean := cluster.Mean(perRun)
+		var ss float64
+		for _, x := range perRun {
+			ss += (x - mean) * (x - mean)
+		}
+		stderr := math.Sqrt(ss / float64(k-1) / float64(k))
+		half = math.Max(half, tCritical(k-1)*stderr)
+	}
+	return half
+}
+
+// tCritical is the two-sided 95% critical value of Student's t with df
+// degrees of freedom.
+func tCritical(df int) float64 {
+	table := [...]float64{12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+		2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+		2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042}
+	switch {
+	case df < 1:
+		return math.Inf(1)
+	case df <= len(table):
+		return table[df-1]
+	}
+	// Beyond the table, the usual expansion around the normal quantile:
+	// within 0.0002 of the exact value from 31 degrees of freedom up, and
+	// tending to 1.96 without a step.
+	const z = 1.959964
+	n := float64(df)
+	return z + (z*z*z+z)/(4*n) + (5*math.Pow(z, 5)+16*z*z*z+3*z)/(96*n*n)
 }
 
 // Detection scores the detectors on one condition.
