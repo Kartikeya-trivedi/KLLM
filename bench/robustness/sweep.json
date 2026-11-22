@@ -1,0 +1,207 @@
+{
+  "nodes": 7,
+  "max_adversaries": 4,
+  "requests": 1000,
+  "seeds": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "attacks": [
+    "crash",
+    "straggler",
+    "random",
+    "perturb",
+    "truncate",
+    "collude",
+    "stealth",
+    "overconfident",
+    "intermittent",
+    "sleeper",
+    "fast"
+  ],
+  "methods": [
+    {
+      "aggregator": "single",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "majority",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "quorum",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "token-vote",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "mbr",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "borda",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "confidence",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "confidence-clipped",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "max-confidence",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "reputation",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "adaptive",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "majority",
+      "policy": {
+        "mode": "first-k",
+        "timeout_ms": 0,
+        "k": 4
+      }
+    },
+    {
+      "aggregator": "token-vote",
+      "policy": {
+        "mode": "first-k",
+        "timeout_ms": 0,
+        "k": 4
+      }
+    },
+    {
+      "aggregator": "adaptive",
+      "policy": {
+        "mode": "first-k",
+        "timeout_ms": 0,
+        "k": 4
+      }
+    },
+    {
+      "aggregator": "majority",
+      "policy": {
+        "mode": "adaptive",
+        "timeout_ms": 0,
+        "initial": 3,
+        "step": 2,
+        "margin": 1,
+        "order": "hash"
+      }
+    },
+    {
+      "aggregator": "token-vote",
+      "policy": {
+        "mode": "adaptive",
+        "timeout_ms": 0,
+        "initial": 3,
+        "step": 2,
+        "margin": 1,
+        "order": "hash"
+      }
+    },
+    {
+      "aggregator": "adaptive",
+      "policy": {
+        "mode": "adaptive",
+        "timeout_ms": 0,
+        "initial": 3,
+        "step": 2,
+        "margin": 1,
+        "order": "hash"
+      }
+    },
+    {
+      "aggregator": "adaptive",
+      "policy": {
+        "mode": "adaptive",
+        "timeout_ms": 0,
+        "initial": 3,
+        "step": 2,
+        "margin": 1,
+        "order": "trust"
+      }
+    },
+    {
+      "aggregator": "adaptive-no-screen",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "adaptive-no-trust",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "adaptive-no-blocs",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "adaptive-unbounded",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    },
+    {
+      "aggregator": "adaptive-naive",
+      "policy": {
+        "mode": "",
+        "timeout_ms": 0
+      }
+    }
+  ]
+}
