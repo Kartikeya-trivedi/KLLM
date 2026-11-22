@@ -74,10 +74,10 @@ protocol natively, so the real engine is a cluster node as it stands.
 ![accuracy as nodes turn adversarial](docs/assets/robustness_accuracy.png)
 
 With 7 replicas of mixed quality (5,000 requests per point): one node alone is
-right 84.8% of the time, any vote over seven 99.8%. Up to 2 adversaries, plain
+right 84.8% of the time, a majority vote over seven 99.8%. Up to 2 adversaries, plain
 voting is enough. At 3 of 7, majority voting falls to 67.8% in the worst case
 and classic reputation weighting is captured outright on some runs, while the
-`adaptive` strategy holds 97.2%. At 4 of 7 nothing survives. The design,
+`adaptive` strategy holds 97.0%. At 4 of 7 nothing survives. The design,
 the trade-offs between reliability, latency and compute, and the limits of
 these results are in **[docs/CLUSTER.md](docs/CLUSTER.md)**; the full tables
 are in [bench/robustness/report.md](bench/robustness/report.md).

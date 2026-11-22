@@ -36,8 +36,8 @@ func main() {
 	timeout := flag.Duration("timeout", 2*time.Second, "per-request deadline for node calls")
 	health := flag.Duration("health-every", 2*time.Second, "node health-probe interval")
 	aggName := flag.String("aggregator", "majority", "how answers are combined: none | "+strings.Join(aggregate.Names(), " | "))
-	logPath := flag.String("log", "", "append every request (all node responses) to this JSONL file")
-	metricsPath := flag.String("metrics-log", "", "sample every node's stats into this JSONL file")
+	logPath := flag.String("log", "", "write every request (all node responses) to this JSONL file, one line each; an existing file is replaced")
+	metricsPath := flag.String("metrics-log", "", "sample every node's stats into this JSONL file; an existing file is replaced")
 	metricsEvery := flag.Duration("metrics-every", 5*time.Second, "system-metrics sampling interval")
 	flag.Parse()
 

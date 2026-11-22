@@ -21,16 +21,16 @@ setting. It has two halves:
 The short version of the results, for 7 nodes (5,000 requests per cell):
 
 - Redundancy pays before any adversary shows up: one node answers 84.8% of
-  requests exactly right, any vote over seven gets 99.8%.
+  requests exactly right, a majority vote over seven 99.8%.
 - With up to 2 adversarial nodes, every strategy that always answers and does
   not trust self-reported confidence stays at or above 97.8% under every
   attack. The choice barely matters — unless it trusts confidence, which an
   adversary simply sets.
 - At 3 of 7 the strategies separate. Majority voting falls to 67.8% in the
   worst case; classic reputation weighting gets *captured* outright on some
-  runs; the `adaptive` strategy holds 97.2% in its worst case.
-- At 4 of 7 everything is at 0%. No aggregation survives an adversarial
-  majority, and nothing here pretends otherwise.
+  runs; the `adaptive` strategy holds 97.0% in its worst case.
+- At 4 of 7 every aggregation strategy is at 0% in its worst case. None
+  survives an adversarial majority, and nothing here pretends otherwise.
 
 Everything below is reproducible from a seed: `go run ./cmd/robusteval`
 regenerates [`bench/robustness/report.md`](../bench/robustness/report.md), the
@@ -115,7 +115,13 @@ deviate from it on purpose.
 | `overconfident` | collude + report 0.999 confidence | confidence weighting |
 | `intermittent` | collude on a shared 30% of prompts | per-node reputation: each looks 70% honest |
 | `sleeper` | honest for the first half of the run, then collude | learned trust |
-| `fast` | collude, answering in 2 ms | first-k dispatch |
+| `fast` | collude, answering in 2 ms — the same answer and the same reported confidence, only sooner | first-k dispatch |
+
+`fast` is exactly `collude` arriving first only in the lab, where consulting
+the synthetic model costs no real time. In front of a live engine a fast
+adversary cannot wait for the model: it answers without it, and having no
+honest confidence profile to copy, reports a flat one (0.9, or whatever
+`spoof_conf` says).
 
 Every response carries a lab-only `label` (`fault`, `attacked`) so datasets can
 be scored. Aggregators and detectors are always handed `cluster.Blind`
@@ -148,8 +154,10 @@ GET    /healthz      /stats.json          /metrics
 
 ## Logging and data collection
 
-Two append-only JSON Lines files, written by `cmd/orchestrator --log
---metrics-log` on a live cluster and by `cmd/datagen` in the lab:
+Two JSON Lines files, one line appended per event, written by
+`cmd/orchestrator --log --metrics-log` on a live cluster and by `cmd/datagen`
+in the lab. Each run starts its files afresh: an existing file at the same
+path is replaced, not extended.
 
 ```jsonc
 // requests.jsonl — one line per request
@@ -232,7 +240,8 @@ Without a GPU, drop `--upstream` and the nodes run the synthetic model.
 ## Strategies
 
 All implement `cluster.Aggregator` and see only tokens, self-reported
-confidences and latencies. Decisions never depend on arrival order.
+confidences and latencies. Decisions never depend on the order responses
+arrive in; `TestNothingDependsOnArrivalOrder` checks that for every strategy.
 
 | Family | Strategy | Idea |
 |---|---|---|
@@ -246,7 +255,7 @@ confidences and latencies. Decisions never depend on arrival order.
 | | `confidence-clipped` | the same, with no vote allowed above the median confidence |
 | | `max-confidence` | the single most confident answer |
 | adaptive | `reputation` | votes weighted by each node's learned record of agreeing |
-| | `adaptive` | token-level vote + screening + bounded learned discounts + bloc collapsing |
+| | `adaptive` | token-level vote + screening + bounded learned discounts + bloc collapsing; nothing it has learned may overrule a head-count majority |
 
 `token-vote` is worth a sentence. Whole-answer voting wastes the votes of
 honest nodes that diverged late and in different directions; voting token by
@@ -291,6 +300,7 @@ nodes.
 | attack success rate | of requests carrying a tampered answer, how often it was the one returned |
 | worst case, breakdown point | lowest exact match over all attacks at f adversaries; smallest f taking it below 50% |
 | best / worst seed | pooled figures hide runs that fail completely — see *capture* below |
+| 95% interval | from the spread between seeds (a t interval on the per-seed values), never narrower than the binomial interval of the pooled count |
 | latency | mean, p50, p95, p99 until the policy had the answers it needed |
 | efficiency | nodes asked, tokens generated per answer, tokens per correct answer |
 | detection | precision / recall / F1 per response and per node; time to detect; honest nodes wrongly suspected |
@@ -302,8 +312,15 @@ strategy and policy is scored on exactly the same node responses.
 
 Setup: 7 nodes — honest replicas of mixed quality (lossiness 0.05 / 0.10 / 0.20,
 single-node exact match 92% / 85% / 72%) and 0–4 omniscient adversaries;
-16-token answers; 1,000 requests x 5 seeds per condition. A 95% interval on a
-cell near 99% is about ±0.3 points; near 75%, ±1.2.
+16-token answers; 1,000 requests x 5 seeds per condition.
+
+Intervals are computed from the spread between the five seeds, not from the
+5,000 pooled requests, because requests within a run are not independent: a
+strategy that learns is right or wrong for a whole run at a time. For the
+stateless strategies and for `adaptive`, a 95% interval is about ±0.3 points
+on a cell near 99% and about ±2 near 75%. For a cell in which one seed was
+captured it is ±54 points or wider, and that is the honest reading — the
+pooled figure for such a cell does not measure anything stable (point 5).
 
 ### Exact match, 3 of 7 nodes adversarial
 
@@ -312,14 +329,23 @@ cell near 99% is about ±0.3 points; near 75%, ±1.2.
 | single | 84.8 | 49.2 | 49.0 | 47.7 | 48.8 | 70.3 | 47.8 | 78.1 | 48.3 | 48.5 | 85.6 |
 | majority | 99.8 | 88.5 | 74.1 | 67.8 | 87.5 | 93.5 | 87.1 | 96.1 | 97.7 | 99.2 | 97.8 |
 | quorum | 97.9 | 53.8 | 53.7 | 54.2 | 53.6 | 77.5 | 52.3 | 85.5 | 53.7 | 53.8 | 54.7 |
-| token-vote | 99.9 | 96.4 | 75.4 | 69.4 | 96.0 | 97.8 | 95.6 | 98.5 | 97.7 | 98.2 | 97.7 |
+| token-vote | 99.9 | 96.4 | 75.4 | 69.4 | 96.0 | 97.7 | 95.6 | 98.5 | 97.7 | 98.2 | 97.7 |
 | mbr | 99.8 | 91.5 | 74.2 | 68.6 | 91.0 | 95.5 | 90.6 | 97.4 | 97.7 | 99.9 | 97.8 |
 | borda | 99.8 | 88.1 | 74.2 | 68.0 | 87.3 | 93.5 | 86.8 | 96.2 | 95.7 | 99.9 | 97.8 |
-| confidence | 99.8 | 88.5 | 74.1 | 71.3 | 52.9 | 93.5 | 53.3 | 96.1 | 98.8 | 98.8 | 98.9 |
-| confidence-clipped | 99.8 | 88.5 | 74.1 | 69.2 | 85.5 | 93.5 | 85.2 | 96.1 | 99.1 | 99.2 | 98.8 |
-| max-confidence | 94.2 | 86.8 | 73.1 | 48.7 | 0.0 | 91.2 | 7.4 | 92.4 | 96.4 | 96.4 | 96.6 |
-| reputation | 99.7 | 78.9 | 78.8 | 78.8 | 78.6 | 88.5 | 59.0 | 81.9 | 98.2 | 98.1 | 98.4 |
-| **adaptive** | 99.8 | **97.9** | **98.3** | **97.8** | **97.2** | **98.8** | **97.4** | **99.3** | 97.7 | 98.4 | 98.4 |
+| confidence | 99.8 | 88.5 | 74.1 | 71.3 | 52.9 | 93.5 | 87.1 | 96.1 | 98.8 | 98.8 | 98.9 |
+| confidence-clipped | 99.8 | 88.5 | 74.1 | 69.2 | 85.5 | 93.5 | 87.1 | 96.1 | 99.1 | 99.2 | 98.8 |
+| max-confidence | 94.2 | 86.8 | 73.1 | 48.7 | 0.0 | 91.2 | 85.2 | 92.4 | 96.4 | 96.4 | 96.6 |
+| reputation | 99.7 | 78.9 † | 78.8 † | 78.8 † | 78.6 † | 88.5 | 59.0 † | 81.9 | 98.2 | 98.1 | 98.4 |
+| **adaptive** | 99.8 | **97.9** | **98.5** | **97.0** | **97.2** | **98.8** | **97.4** | **99.5** | 97.7 | 98.4 | 98.4 |
+
+† An average over seeds that held (about 98.5%) and seeds that were captured
+(0%); see point 5.
+
+Under wait-for-all, `fast` and `collude` are the same condition for every
+strategy that does not look at arrival time — the same lie with the same
+confidence — measured on different random draws. The gap of about a point
+between those two columns, in the same direction on every stateless row, is
+the size of that draw-to-draw noise.
 
 ### Worst case over all attacks
 
@@ -334,8 +360,11 @@ cell near 99% is about ±0.3 points; near 75%, ±1.2.
 | confidence | 99.8 | 99.3 | 96.6 | 52.9 | 0.0 |
 | confidence-clipped | 99.8 | 99.3 | 98.5 | 69.2 | 0.0 |
 | max-confidence | 94.2 | 0.0 | 0.0 | 0.0 | 0.0 |
-| reputation | 99.7 | 99.0 | 98.9 | 59.0 | 0.0 |
-| adaptive | 99.8 | 99.1 | 98.9 | 97.2 | 0.0 |
+| reputation | 99.7 | 99.0 | 98.9 | 59.0 † | 0.0 |
+| adaptive | 99.8 | 99.1 | 98.9 | 97.0 | 0.0 |
+
+† Worst single seed 0.0. Which attack produced this cell's low is the luck of
+the seeds, not a property of the attack; see point 5.
 
 ### What the numbers say
 
@@ -351,8 +380,11 @@ only.** `token-vote` holds 96.4% under `collude`, because the honest nodes
 pool on their shared prefix. Against an attack that is itself
 prefix-consistent it gains nothing: 75.4% under `stealth`, 69.4% under
 `truncate`. The cheapest attack in the suite — return half the right answer —
-is the strongest one against every stateless strategy, because a truncated
-answer is a correct prefix.
+is the strongest one against every stateless vote that neither abstains nor
+weights by reported confidence (`majority`, `token-vote`, `mbr`, `borda`,
+`confidence-clipped`), because a truncated answer is a correct prefix. The
+confidence-weighted strategies have a worse one, below; `quorum` sits near
+53% under every colluding attack, since what it loses is coverage.
 
 **3. Self-reported confidence is an attack surface.** On honest replicas it
 is a real signal. Against adversaries, `confidence` drops to 52.9% the moment
@@ -378,22 +410,68 @@ side wins early is the side it learns to trust:
 | reputation | truncate | 78.8 | 0.0 | 98.7 |
 | reputation | overconfident | 78.6 | 0.0 | 98.8 |
 | reputation | fast | 59.0 | 0.0 | 98.8 |
-| adaptive-naive | stealth | 79.3 | 1.5 | 99.0 |
+| adaptive-naive | stealth | 79.2 | 1.5 | 99.0 |
 
 A pooled 78.9% does not mean "somewhat worse". It means right on four runs
 and **captured** on the fifth: 0% for a thousand requests, with every honest
-node distrusted. The first version of `adaptive` (kept as the
-`adaptive-naive` ablation) did the same under `stealth`. Three rules removed
-the captured state:
+node distrusted.
+
+The five `reputation` rows are one phenomenon, not five. Reputation reads
+neither confidence nor arrival time, so `collude`, `overconfident` and `fast`
+are the same attack to it. It was captured on one seed in five in four of the
+rows and on two in five under `fast`; that difference is the luck of the
+draw, and so is which attack the worst-case table names. With five seeds the
+interval on each of these cells is ±54 points or wider — enough to show that
+capture happens, not to say how often.
+
+The first version of `adaptive` (kept as the `adaptive-naive` ablation) was
+captured the same way under `stealth`. Four rules removed the captured state:
 
 - **Learn only from decisive requests** — those a strict majority of the
   answering nodes settled outright. A minority cannot manufacture one, so
   nothing it wins by a tie or a split ever becomes evidence.
+- **A head-count majority is final** — at every token position, a token that
+  more than half of the answering nodes back is taken whatever the learned
+  weights say. An answer that was screened is not a backer. Discounts and
+  bloc collapsing decide only what no majority settles.
 - **Bounded influence** — with n voters, a learned discount leaves at least
   n/(n+1) of a vote: enough to settle equal head counts in favour of the
-  better record, never enough to overturn a head-count majority.
+  better record, not enough for a smaller group to out-vote a larger one on
+  its record alone.
 - **Only minority blocs collapse** — a bloc of half the nodes or more is
   presumed to be the honest majority agreeing, and left alone.
+
+The second rule was added after the other three turned out not to be enough,
+and the standard suite could not have shown it. The scenario that did: two
+honest replicas that share their mistakes (two copies of one quantised model,
+say) and three sleepers. The pair deviate together, so the tracker reads them
+as a bloc and they share one vote; they have the worse record, so that vote
+is discounted; and four honest nodes in agreement then weigh less than three
+sleepers. No such decision is "decisive", so the strategy never learned
+otherwise: 20.3% exact match on a run where plain majority voting scored
+76.9%. Sharing a vote is not a discount, so the discount bound did not cover
+it. With a majority made final the same run scores 95.8%, and the sleepers
+are identified 11 requests after they wake
+(`TestCorrelatedReplicasDoNotHandSleepersTheVote`). With three such replicas
+instead of two, about a fifth of requests are lost to every strategy — three
+honest nodes are wrong together — and `adaptive` sits level with majority
+voting (77.8% against 77.3%) where its unbounded variant is captured at
+19.7%.
+
+The rule has a price. A majority is taken at its word even when part of it
+is a bloc the strategy has already identified: three known colluders joined
+by one honest node making the same mistake are four of seven, and win that
+request (`TestAMajorityIsTakenAtItsWord`). Nothing in the standard suite
+aims for that, and against the suite the rule costs nothing measurable — at
+3 of 7, no cell moves by more than 0.4 points with the bounds removed
+(point 6). An adversary can aim for it, though. Colluders that give the
+answer an honest replica gives when it slips at its least certain token
+find themselves in a majority far more often. Measured once, outside the
+suite, `adaptive` then scored about 74% at 3 of 7 where the same strategy
+without the rule scored about 79% (token-level voting: 70%). That is the
+trade: trusting what has been learned does better against that attack and
+can be captured outright; never overruling a majority cannot be captured,
+and gives those points up.
 
 **6. What each part of `adaptive` contributes** (exact match at f=3; the
 bracket is the worst seed where it differs by more than 5 points):
@@ -401,23 +479,28 @@ bracket is the worst seed where it differs by more than 5 points):
 | variant | truncate | collude | stealth | overconfident | intermittent | fast |
 |---|--:|--:|--:|--:|--:|--:|
 | token-vote (the base) | 69.4 | 96.4 | 75.4 | 96.0 | 98.5 | 95.6 |
-| adaptive | 97.8 | 97.9 | 98.3 | 97.2 | 99.3 | 97.4 |
-| − screening | 98.2 | 97.9 | 98.4 | 97.2 | 99.4 | 97.4 |
-| − learned discount | 97.7 | 97.9 | 97.0 | 97.2 | 99.0 | 97.3 |
-| − bloc collapsing | 97.8 | 97.7 | 91.5 | 97.1 | 98.1 | 97.3 |
-| unbounded discounts | 97.8 | 97.9 | 98.7 | 97.2 | 99.3 | 97.4 |
-| learn from everything (naive) | 97.8 | 97.9 | 79.3 [1.5] | 97.7 | 99.1 | 97.6 |
+| adaptive | 97.0 | 97.9 | 98.5 | 97.2 | 99.5 | 97.4 |
+| − screening | 98.3 | 97.9 | 98.6 | 97.2 | 99.5 | 97.4 |
+| − learned discount | 96.9 | 97.6 | 97.0 | 97.1 | 99.1 | 97.1 |
+| − bloc collapsing | 97.0 | 97.7 | 91.5 | 97.1 | 98.1 | 97.2 |
+| unbounded (no discount floor, no majority rule, any bloc collapses) | 97.0 | 97.9 | 98.5 | 97.2 | 99.3 | 97.4 |
+| unbounded and learning from everything (naive) | 97.7 | 97.9 | 79.2 [1.5] | 97.7 | 99.1 | 97.4 |
 
 Read plainly: the defences overlap. For most attacks, removing any one of them
-changes nothing because another covers it — `truncate` is handled equally
-well by screening, by the learned discount, or by bloc collapsing. The
-exception is `stealth`, where bloc collapsing carries the weight (91.5%
-without it). **Per-request screening contributes nothing measurable on its
-own in this suite** (within half a point everywhere). And once learning is
-restricted to decisive requests, bounding the discounts changes no number
-here: it is kept as a guarantee
-(`TestLearnedDiscountCannotOverturnAMajority`), not because the sweep needed
-it.
+changes little because another covers it. The exception is `stealth`, where
+bloc collapsing carries the weight (91.5% without it). **Per-request
+screening does not earn its place in this suite**: it moves no cell by more
+than 0.1 points except `truncate`, where the strategy is 1.3 points better
+without it.
+
+Once learning is restricted to decisive requests, removing the bounds — the
+discount floor, the majority rule and the limit on which blocs collapse —
+moves no cell here by more than 0.4 points, in either direction. That is a
+statement about the suite, not about the bounds. The suite has no honest
+replicas with correlated errors, and in the scenario under point 5 the same
+ablation scores 20% against 96%. The bounds are kept as guarantees, checked
+by `TestLearnedDiscountCannotOverturnAMajority` and
+`TestSharedVotesCannotOverturnAMajority`.
 
 ## Reliability against cost
 
@@ -458,17 +541,17 @@ verdict against the nodes that actually tampered.
 | attack | stateless recall | with memory: recall | precision | node P / R | requests to detect |
 |---|--:|--:|--:|--:|--:|
 | crash | 100.0 | 100.0 | 83.1 | 100 / 100 | 11.6 |
-| random | 89.7 | 99.8 | 90.8 | 100 / 100 | 15.2 |
-| truncate | 100.0 | 100.0 | 88.4 | 100 / 100 | 15.4 |
-| collude | 88.4 | 99.9 | 90.0 | 100 / 100 | 13.2 |
-| overconfident | 93.1 | 99.9 | 90.2 | 100 / 100 | 13.6 |
-| fast | 92.5 | 99.9 | 90.3 | 100 / 100 | 13.4 |
-| perturb | 2.2 | 98.7 | 83.4 | 100 / 100 | 14.0 |
-| stealth | 0.0 | 98.6 | 83.4 | 100 / 100 | 14.4 |
-| sleeper | 87.6 | 99.8 | 73.1 | 100 / 100 | 9.4 |
-| intermittent | 87.5 | 99.7 | 57.5 | 100 / 100 | 27.8 |
+| random | 89.8 | 99.8 | 90.0 | 100 / 100 | 15.2 |
+| truncate | 100.0 | 100.0 | 87.9 | 100 / 100 | 15.4 |
+| collude | 88.5 | 99.9 | 89.3 | 100 / 100 | 13.2 |
+| overconfident | 93.1 | 99.9 | 89.5 | 100 / 100 | 13.6 |
+| fast | 90.0 | 99.8 | 89.5 | 100 / 100 | 13.4 |
+| perturb | 3.0 | 98.7 | 83.3 | 100 / 100 | 14.0 |
+| stealth | 0.0 | 98.6 | 83.3 | 100 / 100 | 14.4 |
+| sleeper | 87.6 | 99.8 | 72.4 | 100 / 100 | 9.4 |
+| intermittent | 87.6 | 99.7 | 57.1 | 100 / 100 | 27.8 |
 | collude, f=3 | 0.1 | 97.3 | 97.3 | 100 / 100 | 26.2 |
-| stealth, f=3 | 0.1 | 97.2 | 90.2 | 100 / 100 | 24.0 |
+| stealth, f=3 | 0.1 | 97.2 | 90.0 | 100 / 100 | 24.0 |
 
 - **Node-level detection was exact, with one exception.** For every content
   attack with one to three adversaries, every adversarial node was identified
@@ -479,13 +562,16 @@ verdict against the nodes that actually tampered.
   never flagged (recall 0). It is also harmless to the vote — exact match
   stays above 99%.
 - **The stateless detector fails in two predictable ways.** It cannot see
-  attacks designed to look similar (`perturb` 2.2%, `stealth` 0.0%), and it
+  attacks designed to look similar (`perturb` 3.0%, `stealth` 0.0%), and it
   stops working once adversaries are numerous: three of seven is not an
-  outlier, so recall on `collude` drops from 88.4% to 0.1%. Memory restores
+  outlier, so recall on `collude` drops from 88.5% to 0.1%. Memory restores
   both to 97% or better.
-- **Response-level precision is lower by design.** It counts an adversary's
-  *honest* answers as false positives once the node is a suspect — which is
-  most of what a sleeper or an intermittent colluder sends.
+- **Response-level precision is lower because it measures "tampered", not
+  "wrong".** With two sleepers, 1,881 of the 1,904 false positives are honest
+  nodes whose answer to that request was wrong: untampered, so they count
+  against the detector, but wrong, and setting them aside costs the vote
+  nothing. Only 7 are an adversary's honest answer. With two intermittent
+  colluders the figures are 2,209 of 2,234, and 14.
 - **Stragglers are never flagged as adversarial**, correctly: they are slow,
   not dishonest. `slow` is an operational flag.
 
@@ -509,7 +595,18 @@ What these results do and do not establish:
 - **Adversaries are omniscient but not adaptive.** They know the right answer;
   they do not know or react to the defence. An adversary that adds noise to
   its honest behaviour to dodge bloc detection, or that probes for which
-  requests are decisive, is outside the suite.
+  requests are decisive, is outside the suite. So is one that imitates the
+  likeliest honest mistake in order to be joined by an honest node: one
+  measurement of that (point 5) put `adaptive` at about 74% with three of
+  seven, well below anything the suite shows.
+- **Honest replicas are assumed to err independently.** `Corr` exists, but
+  the standard suite does not use it. Replicas that share their mistakes are
+  a bloc as far as the tracker can tell, and get one vote between them while
+  they deviate together — a fair reading of correlated evidence, though not
+  what "adversarial" means. Two scenarios with such replicas are covered by a
+  test; none is in the sweep.
+- **Five seeds.** Enough to show that capture happens, not to estimate how
+  often. An interval of ±54 points on a captured cell says only that.
 - **One cluster shape.** Seven nodes, three honest quality levels, 16-token
   answers. The breakdown at f=4 is the general n/2 bound; where exactly each
   strategy starts to bend below it depends on how accurate the honest nodes
@@ -521,7 +618,7 @@ What these results do and do not establish:
 
 ```powershell
 go test ./cluster/...                              # ~20 s, no GPU needed
-go run ./cmd/robusteval --seeds 5 --out bench/robustness   # the sweep: ~1 min
+go run ./cmd/robusteval                            # the sweep: ~1 min, rewrites bench/robustness
 python tools/plot_robustness.py                    # the two figures
 go run ./cmd/datagen --suite --out data/suite      # the datasets themselves
 go run ./cmd/robusteval --data data/suite/stealth-f3/requests.jsonl   # score one log
