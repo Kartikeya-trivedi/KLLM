@@ -11,6 +11,21 @@ import (
 func init() {
 	registry["reputation"] = Reputation
 	registry["adaptive"] = Adaptive
+	// Ablations of adaptive, for measuring what each defence contributes.
+	for name, o := range map[string]AdaptiveOptions{
+		"adaptive-no-screen": {NoScreen: true},
+		"adaptive-no-trust":  {NoTrust: true},
+		"adaptive-no-blocs":  {NoBlocs: true},
+		"adaptive-unbounded": {Unbounded: true},
+		// The naive design: learn from everything, with nothing bounded.
+		"adaptive-naive": {Unbounded: true, LearnAlways: true},
+	} {
+		registry[name] = func() cluster.Aggregator {
+			a := AdaptiveWith(o).(*adaptive)
+			a.name = name
+			return a
+		}
+	}
 }
 
 // The adaptive strategies carry state across requests: they watch which
@@ -45,30 +60,59 @@ func (a *reputation) Aggregate(_ cluster.Request, resps []cluster.Response) clus
 //
 //   - Token-level voting, so honest nodes that diverge late still pool
 //     their support.
-//   - Trust weights that can only discount: a node's weight is its trust,
-//     capped at the median trust of the nodes answering. A good record
+//   - Per-request screening: answers flagged as outliers, over-confident,
+//     implausibly fast or truncated are set aside before the vote. This
+//     uses only the request in hand, so it cannot feed on itself.
+//   - A learned discount for nodes with a worse record than the typical
+//     voter, or whose disagreement has just jumped (drift). A good record
 //     earns an ordinary vote, never a bigger one, so a sleeper's patience
 //     buys nothing.
-//   - Per-request screening: answers flagged as outliers, over-confident,
-//     implausibly fast or truncated are set aside before the vote.
 //   - Bloc collapsing: nodes found to deviate in lockstep share one vote
-//     when they answer identically, however many of them there are.
-//   - Drift: a node whose disagreement jumps is discounted at once, without
-//     waiting for its trust to decay.
-func Adaptive() cluster.Aggregator {
+//     when they answer identically.
+//
+// The last two learn from the strategy's own decisions, and anything that
+// does is bistable: if the adversaries win often enough early on, it is
+// the honest nodes whose record looks bad, and the strategy talks itself
+// into trusting the wrong side for good. Three limits prevent that:
+//
+//   - Learn only from decisive requests: those a strict majority of the
+//     answering nodes settled outright. A minority cannot manufacture
+//     one, so what it wins never becomes evidence.
+//   - Bounded influence. With n voters, a learned discount can lower a
+//     vote to n/(n+1) of a full one and no further. That is enough to
+//     settle any contest between equal head counts in favour of the side
+//     with the better record, and never enough to overturn a head-count
+//     majority — so honest nodes that agree unanimously cannot be
+//     out-voted by history, and a captured state cannot sustain itself.
+//   - Only minority blocs collapse. Honest nodes that are right also
+//     deviate together whenever the adversaries win a vote; a bloc of at
+//     least half the voters is taken to be exactly that, and left alone.
+func Adaptive() cluster.Aggregator { return AdaptiveWith(AdaptiveOptions{}) }
+
+// AdaptiveOptions switches off parts of the adaptive strategy, for
+// ablation: which defence is earning its keep?
+type AdaptiveOptions struct {
+	NoScreen    bool // skip per-request screening
+	NoTrust     bool // skip the learned discount (trust and drift)
+	NoBlocs     bool // skip bloc collapsing
+	Unbounded   bool // let learned discounts go to zero and collapse any bloc
+	LearnAlways bool // learn from every decision, not just the decisive ones
+}
+
+// AdaptiveWith builds the adaptive strategy with some defences disabled.
+func AdaptiveWith(o AdaptiveOptions) cluster.Aggregator {
 	cfg := detect.Default()
-	return &adaptive{cfg: cfg, tr: detect.NewTracker(cfg)}
+	return &adaptive{name: "adaptive", cfg: cfg, tr: detect.NewTracker(cfg), opt: o}
 }
 
 type adaptive struct {
-	cfg detect.Config
-	tr  *detect.Tracker
+	name string
+	cfg  detect.Config
+	tr   *detect.Tracker
+	opt  AdaptiveOptions
 }
 
-// driftPenalty scales the vote of a node whose behaviour has changed.
-const driftPenalty = 0.1
-
-func (a *adaptive) Name() string              { return "adaptive" }
+func (a *adaptive) Name() string              { return a.name }
 func (a *adaptive) Trust(node string) float64 { return a.tr.Trust(node) }
 func (a *adaptive) Tracker() *detect.Tracker  { return a.tr }
 
@@ -77,52 +121,75 @@ func (a *adaptive) Aggregate(_ cluster.Request, resps []cluster.Response) cluste
 
 	// Screen this request's answers.
 	screened := map[string]bool{}
-	for _, f := range a.cfg.Inspect(resps) {
-		if f.Reason != detect.Failed && detect.Adversarial(f.Reason) {
-			screened[f.Node] = true
+	if !a.opt.NoScreen {
+		for _, f := range a.cfg.Inspect(resps) {
+			if f.Reason != detect.Failed && detect.Adversarial(f.Reason) {
+				screened[f.Node] = true
+			}
+		}
+		if len(screened) >= len(answered) { // never screen out everyone
+			screened = map[string]bool{}
 		}
 	}
-	if len(screened) >= len(answered) { // never screen out everyone
-		screened = map[string]bool{}
-	}
-
-	// Trust, capped at the median of those voting.
+	byNode := map[string]cluster.Response{}
 	trust := map[string]float64{}
 	var voting []float64
 	for _, r := range answered {
+		byNode[r.Node] = r
 		trust[r.Node] = a.tr.Trust(r.Node)
 		if !screened[r.Node] {
 			voting = append(voting, trust[r.Node])
 		}
 	}
-	ceiling := cluster.Median(voting)
+	voters := float64(len(voting))
+	typical := cluster.Median(voting)
 
-	drifted := map[string]bool{}
-	for _, s := range a.tr.Suspects() {
-		for _, why := range s.Reasons {
-			if why == detect.Drift {
-				drifted[s.Node] = true
+	// The learned discount: 0 for a node with at least a typical record,
+	// rising to 1 for one with no record of agreeing, or one that has
+	// just changed behaviour.
+	discount := map[string]float64{}
+	if !a.opt.NoTrust {
+		for id, t := range trust {
+			if typical > 0 && t < typical {
+				discount[id] = 1 - t/typical
+			}
+		}
+		for _, s := range a.tr.Suspects() {
+			for _, why := range s.Reasons {
+				if why == detect.Drift {
+					discount[s.Node] = 1
+				}
 			}
 		}
 	}
+	floor := voters / (voters + 1) // the least a learned discount may leave of a vote
+	if a.opt.Unbounded {
+		floor = 0
+	}
 
-	// Members of a bloc who give the same answer split one vote.
+	// Members of a minority bloc who give the same answer split one vote.
 	share := map[string]float64{}
-	byNode := map[string]cluster.Response{}
-	for _, r := range answered {
-		byNode[r.Node] = r
-	}
-	for _, bloc := range a.tr.Blocs() {
-		same := map[string][]string{}
-		for _, id := range bloc {
-			if r, ok := byNode[id]; ok && !screened[id] {
-				k := cluster.Key(r.Tokens)
-				same[k] = append(same[k], id)
+	if !a.opt.NoBlocs {
+		for _, bloc := range a.tr.Blocs() {
+			present := 0
+			same := map[string][]string{}
+			for _, id := range bloc {
+				if r, ok := byNode[id]; ok && !screened[id] {
+					present++
+					k := cluster.Key(r.Tokens)
+					same[k] = append(same[k], id)
+				}
 			}
-		}
-		for _, ids := range same {
-			for _, id := range ids {
-				share[id] = 1 / float64(len(ids))
+			// Measured against everyone who answered, not just those who
+			// survived screening: screening a few honest stragglers must
+			// not promote a colluding minority to "half the cluster".
+			if !a.opt.Unbounded && 2*present >= len(answered) {
+				continue // at least half the nodes: presumed to be the honest majority
+			}
+			for _, ids := range same {
+				for _, id := range ids {
+					share[id] = 1 / float64(len(ids))
+				}
 			}
 		}
 	}
@@ -131,17 +198,27 @@ func (a *adaptive) Aggregate(_ cluster.Request, resps []cluster.Response) cluste
 		if screened[r.Node] {
 			return 0
 		}
-		w := math.Min(trust[r.Node], ceiling)
-		if drifted[r.Node] {
-			w *= driftPenalty
-		}
+		w := 1 - (1-floor)*math.Min(1, discount[r.Node])
 		if s, ok := share[r.Node]; ok {
 			w *= s
 		}
 		return w
 	}
 	d := prefixVote(resps, weight)
-	a.tr.Observe(resps, d.Tokens)
+
+	// Learn only from requests that a strict majority of the answering
+	// nodes settled outright. Fewer than half the nodes cannot produce
+	// such a result on their own, so nothing an adversarial minority wins
+	// — a tie broken its way, a bloc that out-voted split honest nodes —
+	// ever becomes evidence. Learning from contested decisions is what
+	// lets a strategy talk itself into trusting the wrong side.
+	heads, _ := tally(resps, one)
+	decisive := len(heads) > 0 && 2*len(heads[0].nodes) > len(answered) && cluster.Equal(heads[0].tokens, d.Tokens)
+	if decisive || a.opt.LearnAlways {
+		a.tr.Observe(resps, d.Tokens)
+	} else {
+		a.tr.Skip()
+	}
 
 	// Report whom this decision distrusted: screened answers, plus known
 	// suspects that dissented from it.

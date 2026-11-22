@@ -227,6 +227,15 @@ func (t *Tracker) Suspects() []Suspect {
 	return out
 }
 
+// Skip records that a request went by without being used as evidence, so
+// DetectedAt stays in units of requests seen rather than requests learnt
+// from.
+func (t *Tracker) Skip() {
+	t.mu.Lock()
+	t.n++
+	t.mu.Unlock()
+}
+
 // Observed is the number of requests folded in so far.
 func (t *Tracker) Observed() int {
 	t.mu.Lock()

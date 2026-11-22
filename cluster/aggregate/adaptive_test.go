@@ -1,10 +1,13 @@
 package aggregate
 
 import (
+	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"kllm/cluster"
+	"kllm/cluster/dataset"
 	"kllm/cluster/detect"
 	"kllm/cluster/record"
 )
@@ -110,6 +113,114 @@ func TestSleeperAttack(t *testing.T) {
 	if after["adaptive"] < after["token-vote"]-0.01 || after["adaptive"] < after["reputation"] {
 		t.Errorf("adaptive (%.3f) should match or beat token-vote (%.3f) and reputation (%.3f)",
 			after["adaptive"], after["token-vote"], after["reputation"])
+	}
+}
+
+// Strategies that learn from their own decisions are bistable near the
+// breaking point: whichever side wins early is the side the strategy
+// learns to trust. Stealth colluders at 3 of 7 win about a quarter of
+// plain token votes — enough, on an unlucky run, to capture a strategy
+// that learns from every decision. Learning only from decisive requests
+// removes the captured state. (Seed 2 is such a run; the claim is checked
+// on every seed.)
+func TestLearningFromContestedDecisionsInvitesCapture(t *testing.T) {
+	worst := map[string]float64{}
+	var perSeed []string
+	for seed := uint64(1); seed <= 4; seed++ {
+		sc, err := dataset.Standard("stealth", 7, 3, 1000, seed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		recs, _, err := dataset.Collect(context.Background(), sc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		line := fmt.Sprintf("seed %d:", seed)
+		for _, name := range []string{"token-vote", "reputation", "adaptive-naive", "adaptive"} {
+			acc := replay(t, agg(t, name), recs, 0, len(recs))
+			if w, ok := worst[name]; !ok || acc < w {
+				worst[name] = acc
+			}
+			line += fmt.Sprintf(" %s=%.3f", name, acc)
+		}
+		perSeed = append(perSeed, line)
+	}
+	t.Log(strings.Join(perSeed, "\n"))
+
+	if worst["reputation"] > 0.2 || worst["adaptive-naive"] > 0.2 {
+		t.Errorf("expected reputation (worst %.3f) and naive adaptive (worst %.3f) to be captured on some seed",
+			worst["reputation"], worst["adaptive-naive"])
+	}
+	if worst["adaptive"] < 0.95 {
+		t.Errorf("adaptive should hold on every seed, worst was %.3f", worst["adaptive"])
+	}
+	if worst["token-vote"] > 0.85 || worst["token-vote"] < 0.6 {
+		t.Errorf("token-vote was expected to sit near 0.75 here, worst %.3f", worst["token-vote"])
+	}
+}
+
+// history plays 200 requests in which x, y, z agree and a..d each answer
+// differently — three nodes out-voting four that split.
+func history(a cluster.Aggregator) {
+	right := seq(1, 16)
+	for i := 0; i < 200; i++ {
+		var resps []cluster.Response
+		for _, id := range []string{"x", "y", "z"} {
+			resps = append(resps, ans(id, .9, right...))
+		}
+		for j, id := range []string{"a", "b", "c", "d"} {
+			resps = append(resps, ans(id, .9, splice(right, 4, 1000*(j+1)+i)...)) // each in its own way
+		}
+		a.Aggregate(cluster.Request{ID: fmt.Sprint(i)}, resps)
+	}
+}
+
+// Three nodes that out-vote four split ones have won, but they have not
+// proved anything: the default strategy does not learn from it.
+func TestContestedDecisionsAreNotEvidence(t *testing.T) {
+	a := agg(t, "adaptive").(tracked)
+	history(a)
+	for _, id := range []string{"a", "x"} {
+		if got := a.Trust(id); got != 0.5 {
+			t.Fatalf("trust in %s moved to %.2f on contested decisions alone", id, got)
+		}
+	}
+	if len(a.Tracker().Suspects()) != 0 || a.Tracker().Observed() != 200 {
+		t.Fatalf("suspects %v after %d requests", a.Tracker().Suspects(), a.Tracker().Observed())
+	}
+	naive := agg(t, "adaptive-naive").(tracked)
+	history(naive)
+	if naive.Trust("a") > 0.1 || naive.Trust("x") < 0.9 {
+		t.Fatalf("the naive variant should have learnt it: a=%.2f x=%.2f", naive.Trust("a"), naive.Trust("x"))
+	}
+}
+
+// Even with a bad history in hand, a learned discount must never overturn
+// a head-count majority: that is what bounded influence guarantees.
+func TestLearnedDiscountCannotOverturnAMajority(t *testing.T) {
+	right, wrong := seq(1, 16), splice(seq(1, 16), 12, 500)
+	// The four distrusted nodes now agree with each other against the three trusted ones.
+	var resps []cluster.Response
+	for _, id := range []string{"x", "y", "z"} {
+		resps = append(resps, ans(id, .9, wrong...))
+	}
+	for _, id := range []string{"a", "b", "c", "d"} {
+		resps = append(resps, ans(id, .9, right...))
+	}
+
+	bounded := AdaptiveWith(AdaptiveOptions{LearnAlways: true}).(tracked) // learns the bad history, but bounded
+	history(bounded)
+	if bounded.Trust("a") > 0.1 || bounded.Trust("x") < 0.9 {
+		t.Fatalf("setup: trust a=%.2f x=%.2f", bounded.Trust("a"), bounded.Trust("x"))
+	}
+	if d := bounded.Aggregate(cluster.Request{ID: "final"}, resps); !cluster.Equal(d.Tokens, right) {
+		t.Fatalf("four agreeing nodes were out-voted by three on reputation alone: winners %v", d.Winners)
+	}
+
+	naive := agg(t, "adaptive-naive")
+	history(naive)
+	if d := naive.Aggregate(cluster.Request{ID: "final"}, resps); !cluster.Equal(d.Tokens, wrong) {
+		t.Fatalf("expected the unbounded variant to side with reputation, winners %v", d.Winners)
 	}
 }
 
