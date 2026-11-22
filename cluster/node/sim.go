@@ -161,6 +161,9 @@ func (s *Sim) Model() string {
 	return fmt.Sprintf("sim-%d/noise=%.3g", s.M.Seed, s.Noise)
 }
 
+// Instant reports that generating costs no real time (see Output.Latency).
+func (s *Sim) Instant() bool { return true }
+
 func (s *Sim) Generate(ctx context.Context, req cluster.Request) (Output, error) {
 	if err := ctx.Err(); err != nil {
 		return Output{}, err

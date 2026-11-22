@@ -46,3 +46,11 @@ type Backend interface {
 	Model() string
 	Generate(ctx context.Context, req cluster.Request) (Output, error)
 }
+
+// Instant is implemented by a backend whose Generate takes no real time:
+// the synthetic model, which reports a latency instead of spending it. A
+// Fast adversary can consult such a model and still answer first; in front
+// of anything else it has to answer without it.
+type Instant interface {
+	Instant() bool
+}

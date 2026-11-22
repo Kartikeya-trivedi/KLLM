@@ -63,6 +63,17 @@ type Fault struct {
 
 	// Fast makes attacked responses return almost immediately — the attack
 	// on first-k dispatch, which trusts whoever answers first.
+	//
+	// In front of the synthetic model, nothing else about the response
+	// changes: consulting that model costs no real time, so the adversary
+	// reports the tokens and the confidence the same fault would report at
+	// normal speed, and what arriving first buys can be measured on its
+	// own. In front of a backend that takes real time (a live engine) it
+	// cannot wait for the model. If its answer is wholly fabricated it
+	// answers without one, and then has no honest confidence profile to
+	// copy: it reports SpoofConf, or failing that a flat 0.9. If its answer
+	// needs the honest one (an honest prefix, a truncation), it is only as
+	// fast as the model.
 	Fast bool `json:"fast,omitempty"`
 }
 
@@ -203,10 +214,15 @@ func (b *faulty) Generate(ctx context.Context, req cluster.Request) (Output, err
 		return Output{Label: label, Latency: fastLatency + delay}, ErrCrashed // a refused connection fails fast
 	}
 
-	// An adversary that fabricates the whole answer need not run the model.
+	// A Fast adversary skips the model only when waiting for it would cost
+	// real time and its answer does not depend on it (see Fault.Fast).
 	fabricated := b.f.Kind == FaultRandom || (b.f.Kind == FaultCollude && b.f.Keep == 0)
+	free := false
+	if i, ok := b.inner.(Instant); ok {
+		free = i.Instant()
+	}
 	var base Output
-	if !(strike && b.f.Fast && fabricated) {
+	if !(strike && b.f.Fast && fabricated && !free) {
 		var err error
 		if base, err = b.inner.Generate(ctx, req); err != nil {
 			base.Label = label
@@ -254,14 +270,19 @@ func (b *faulty) Generate(ctx context.Context, req cluster.Request) (Output, err
 		}
 
 	case FaultCollude:
+		// A wholly fabricated lie (Keep 0) is a function of the group's
+		// secret and the prompt alone, so every member emits the same one
+		// whether or not it ran the model. With an honest prefix, the
+		// first invented token is nudged off the honest one, so the lie
+		// departs exactly where it is meant to.
 		k := min(int(b.f.Keep*float64(length)), length-1)
 		target := fold(mix(b.f.Secret^0x636f6c), ph) // same for every member of the group
 		out.Tokens = make([]int32, length)
 		for i := range out.Tokens {
 			switch {
-			case i < k:
+			case i < k && i < len(base.Tokens):
 				out.Tokens[i] = base.Tokens[i]
-			case i == k && i < len(base.Tokens):
+			case i == k && b.f.Keep > 0 && i < len(base.Tokens):
 				out.Tokens[i] = differ(tok(fold(target, uint64(i))), base.Tokens[i])
 			default:
 				out.Tokens[i] = tok(fold(target, uint64(i)))

@@ -24,6 +24,21 @@ func adversary(m SimModel, nodeSeed uint64, f Fault) Backend {
 	return Inject(NewSim(m, nodeSeed, 0), f, nodeSeed, m.Vocab)
 }
 
+// counting records how often the model behind a fault was actually run,
+// and says whether running it is free.
+type counting struct {
+	Backend
+	instant bool
+	calls   int
+}
+
+func (c *counting) Instant() bool { return c.instant }
+
+func (c *counting) Generate(ctx context.Context, req cluster.Request) (Output, error) {
+	c.calls++
+	return c.Backend.Generate(ctx, req)
+}
+
 func TestHonestProfileIsPassthrough(t *testing.T) {
 	m := DefaultSimModel(1)
 	inner := NewSim(m, 3, 0.1)
@@ -195,12 +210,68 @@ func TestSpoofFastAndTruncate(t *testing.T) {
 		t.Fatal("confidence length mismatch")
 	}
 
+	// A fast colluder differs from an ordinary one in arrival time and in
+	// nothing else — in particular not in the confidence it reports, or the
+	// `fast` condition would measure a confidence attack as well.
 	fast := gen(t, adversary(m, 1, preset(t, "fast")), r)
 	if fast.Latency != fastLatency || len(fast.Tokens) != r.MaxNewTokens {
 		t.Fatalf("fast: latency=%v len=%d", fast.Latency, len(fast.Tokens))
 	}
-	if slow := gen(t, adversary(m, 1, preset(t, "collude")), r); !cluster.Equal(fast.Tokens, slow.Tokens) {
+	slow := gen(t, adversary(m, 1, preset(t, "collude")), r)
+	if !cluster.Equal(fast.Tokens, slow.Tokens) {
 		t.Fatal("fast and ordinary colluders of one group must agree")
+	}
+	if slow.Latency <= fastLatency {
+		t.Fatalf("setup: the ordinary colluder answered in %v", slow.Latency)
+	}
+	if len(fast.Conf) != len(slow.Conf) {
+		t.Fatalf("fast reports %d confidences, the ordinary colluder %d", len(fast.Conf), len(slow.Conf))
+	}
+	for i := range fast.Conf {
+		if fast.Conf[i] != slow.Conf[i] {
+			t.Fatalf("token %d: fast reports confidence %g, the ordinary colluder %g", i, fast.Conf[i], slow.Conf[i])
+		}
+	}
+
+	// A fast adversary skips the model only when waiting for it would cost
+	// real time and its answer does not need it.
+	for _, c := range []struct {
+		name    string
+		fault   Fault
+		instant bool // is the model behind it free to consult?
+		calls   int
+	}{
+		{"synthetic model", preset(t, "fast"), true, 1},
+		{"live engine", preset(t, "fast"), false, 0},
+		{"live engine, declared confidence", Fault{Kind: FaultCollude, Secret: 1, Fast: true, SpoofConf: 0.95}, false, 0},
+		{"live engine, honest prefix", Fault{Kind: FaultCollude, Secret: 1, Fast: true, Keep: 0.5}, false, 1},
+	} {
+		inner := &counting{Backend: NewSim(m, 1, 0), instant: c.instant}
+		out := gen(t, Inject(inner, c.fault, 1, m.Vocab), r)
+		if inner.calls != c.calls {
+			t.Errorf("%s: the model ran %d times, want %d", c.name, inner.calls, c.calls)
+		}
+		if out.Latency != fastLatency || len(out.Tokens) != r.MaxNewTokens || len(out.Conf) != len(out.Tokens) {
+			t.Errorf("%s: latency=%v tokens=%d conf=%d", c.name, out.Latency, len(out.Tokens), len(out.Conf))
+		}
+	}
+
+	// With or without the model, a group's fabricated lie is the same lie:
+	// a member that answered blind must not split the group's vote. A small
+	// vocabulary makes the case that used to differ (the lie's first token
+	// happening to be the honest one) common enough to meet.
+	small := SimModel{Seed: 1, Vocab: 8, HardFrac: 0.1}
+	for _, p := range prompts(200) {
+		blind := gen(t, Inject(&counting{Backend: NewSim(small, 1, 0)}, preset(t, "fast"), 1, small.Vocab), p)
+		sighted := gen(t, Inject(NewSim(small, 2, 0), preset(t, "collude"), 2, small.Vocab), p)
+		if !cluster.Equal(blind.Tokens, sighted.Tokens) {
+			t.Fatalf("%s: a member that skipped the model lied %v, one that ran it %v", p.ID, blind.Tokens, sighted.Tokens)
+		}
+		for _, c := range blind.Conf {
+			if c != 0.9 {
+				t.Fatalf("%s: with no model to copy and no declared confidence, reported %g", p.ID, c)
+			}
+		}
 	}
 
 	ref, _ := m.Reference(r.Prompt, r.MaxNewTokens)
