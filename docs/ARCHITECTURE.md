@@ -140,6 +140,19 @@ cmd/
   wbench/     matmul microbench: fp32 cuBLAS vs W4 kernel
   smoke/      walking-skeleton: Go → DLL → CUDA kernel → verify
   inspect/    dump the tensors in a safetensors checkpoint
+  node/         one cluster inference node (synthetic model, or in front of serve)
+  orchestrator/ cluster coordinator: fan-out, dispatch policy, aggregation
+  datagen/      labelled datasets under normal and adversarial conditions
+  robusteval/   compare aggregation strategies and policies under attack
+
+cluster/        distributed inference over several replicas — see CLUSTER.md
+  node/         backends, fault injection, node HTTP server + client
+  orchestrator/ membership, health, dispatch policies, HTTP API
+  record/       JSONL request log + system-metrics sampler
+  dataset/      scenarios, dataset generation, preprocessing
+  aggregate/    voting / token-level / ranking / confidence / adaptive
+  detect/       outlier, drift and collusion detection
+  eval/         metrics, the scenario sweep, the report
 
 engine/
   engine.go       load a checkpoint, Sequence API, greedy Generate
@@ -163,7 +176,8 @@ tools/            offline Python (never in the serving path):
                   modal_lab.py
 
 docs/             PLAN.md (the build plan), JOURNAL.md (build log),
-                  ARCHITECTURE.md (this file), THEORY.md (the concepts)
+                  ARCHITECTURE.md (this file), THEORY.md (the concepts),
+                  CLUSTER.md (the distributed layer and its robustness results)
 ```
 
 ## Why these boundaries pay off

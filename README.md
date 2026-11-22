@@ -60,6 +60,34 @@ doubles end-to-end decode at seq≈512. Attempt 2 (vectorized loads) measured
 (shared-memory X staging, multi-row blocks, CUDA graphs) in the
 [journal](docs/JOURNAL.md).
 
+## Distributed inference and robustness
+
+One engine is one replica. [`cluster/`](cluster) puts several behind an
+orchestrator and asks what happens when some of them are wrong — lossy,
+crashed, slow, or lying on purpose. It is two things: a distributed inference
+system (nodes, orchestration, logging, labelled-dataset generation under
+normal and adversarial conditions) and a framework for combining replica
+outputs (eleven aggregation strategies, outlier / drift / collusion
+detection, and a sweep over eleven attacks). `kllm serve` speaks the node
+protocol natively, so the real engine is a cluster node as it stands.
+
+![accuracy as nodes turn adversarial](docs/assets/robustness_accuracy.png)
+
+With 7 replicas of mixed quality (5,000 requests per point): one node alone is
+right 84.8% of the time, any vote over seven 99.8%. Up to 2 adversaries, plain
+voting is enough. At 3 of 7, majority voting falls to 67.8% in the worst case
+and classic reputation weighting is captured outright on some runs, while the
+`adaptive` strategy holds 97.2%. At 4 of 7 nothing survives. The design,
+the trade-offs between reliability, latency and compute, and the limits of
+these results are in **[docs/CLUSTER.md](docs/CLUSTER.md)**; the full tables
+are in [bench/robustness/report.md](bench/robustness/report.md).
+
+```powershell
+go test ./cluster/...                             # no GPU needed
+go run ./cmd/robusteval --seeds 5                 # the sweep, ~1 min
+go run ./cmd/datagen --suite --out data/suite     # the labelled datasets
+```
+
 ## Try it in your browser (no GPU needed locally)
 
 The engine + playground is deployed on a Modal A10G (scales to zero when
@@ -101,7 +129,9 @@ go run .\cmd\serve --addr 127.0.0.1:8080
 
 Commands: `serve` (server + UI), `generate` (one-shot decode), `bench`
 (TTFT/ITL), `loadgen` (throughput sweep), `wbench` (matmul fp32-vs-W4),
-`inspect` (dump a checkpoint), `smoke` (walking skeleton).
+`inspect` (dump a checkpoint), `smoke` (walking skeleton). The cluster layer
+adds `node`, `orchestrator`, `datagen` and `robusteval`
+([docs/CLUSTER.md](docs/CLUSTER.md)).
 
 ## Observability & experiment tracking
 
@@ -159,7 +189,8 @@ bugs from quantization error.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#repo-map) for the annotated
 tree. Top level: `cmd/` (binaries), `engine/` (Go engine + backend loaders +
-KV + oracle), `models/` (config parsing), `server/` (HTTP/SSE + UI),
+KV + oracle), `cluster/` (distributed inference, aggregation, robustness),
+`models/` (config parsing), `server/` (HTTP/SSE + UI),
 `backend/` (CUDA C++), `tools/` (offline Python: oracles, quantizer, Modal),
 `docs/`.
 
