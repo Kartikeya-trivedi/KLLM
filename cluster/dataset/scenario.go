@@ -9,6 +9,7 @@
 package dataset
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -226,6 +227,22 @@ func (sc Scenario) Build() (*Lab, error) {
 		lab.Faults[id] = label
 	}
 	return lab, nil
+}
+
+// Collect generates a scenario's dataset in memory.
+func Collect(ctx context.Context, sc Scenario) ([]record.Record, *Lab, error) {
+	var buf bytes.Buffer
+	w := record.NewWriter(&buf)
+	lab, err := Generate(ctx, sc, w, Options{})
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := w.Flush(); err != nil {
+		return nil, nil, err
+	}
+	var recs []record.Record
+	err = record.Scan(&buf, func(r record.Record) error { recs = append(recs, r); return nil })
+	return recs, lab, err
 }
 
 // Options tunes generation.
