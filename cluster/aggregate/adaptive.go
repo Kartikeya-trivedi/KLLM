@@ -73,20 +73,37 @@ func (a *reputation) Aggregate(_ cluster.Request, resps []cluster.Response) clus
 // The last two learn from the strategy's own decisions, and anything that
 // does is bistable: if the adversaries win often enough early on, it is
 // the honest nodes whose record looks bad, and the strategy talks itself
-// into trusting the wrong side for good. Three limits prevent that:
+// into trusting the wrong side for good. Four limits prevent that:
 //
 //   - Learn only from decisive requests: those a strict majority of the
 //     answering nodes settled outright. A minority cannot manufacture
 //     one, so what it wins never becomes evidence.
+//   - A head-count majority is final. At every position, a token that
+//     more than half of the answering nodes back is taken whatever the
+//     learned weights say; a screened answer is not a backer. Discounts
+//     and shared votes decide only what no majority settles, so honest
+//     nodes that agree cannot be out-voted by anything the strategy has
+//     learned, and a captured state cannot sustain itself.
 //   - Bounded influence. With n voters, a learned discount can lower a
 //     vote to n/(n+1) of a full one and no further. That is enough to
 //     settle any contest between equal head counts in favour of the side
-//     with the better record, and never enough to overturn a head-count
-//     majority — so honest nodes that agree unanimously cannot be
-//     out-voted by history, and a captured state cannot sustain itself.
+//     with the better record, and not enough to let a smaller group
+//     out-vote a larger one on its record alone.
 //   - Only minority blocs collapse. Honest nodes that are right also
 //     deviate together whenever the adversaries win a vote; a bloc of at
 //     least half the voters is taken to be exactly that, and left alone.
+//
+// The second limit is what makes the others safe to combine, and it has a
+// price. Sharing a vote is not bounded the way a discount is: honest
+// replicas that share their mistakes (two copies of one quantised model,
+// say) are a bloc as far as the evidence goes, and one discounted vote
+// between them hands a 4-against-3 contest to the three. Any ordering that
+// lets learned state overrule a majority can be captured that way —
+// ranking by independent evidence first only moves the threshold to three
+// such replicas. The price is that a majority is taken at its word even
+// when part of it is a bloc the strategy has already identified:
+// colluders joined by an honest node making the same mistake win that
+// request, where trusting the inference would have stopped them.
 func Adaptive() cluster.Aggregator { return AdaptiveWith(AdaptiveOptions{}) }
 
 // AdaptiveOptions switches off parts of the adaptive strategy, for
@@ -95,7 +112,7 @@ type AdaptiveOptions struct {
 	NoScreen    bool // skip per-request screening
 	NoTrust     bool // skip the learned discount (trust and drift)
 	NoBlocs     bool // skip bloc collapsing
-	Unbounded   bool // let learned discounts go to zero and collapse any bloc
+	Unbounded   bool // let learned discounts go to zero, collapse any bloc, and let weights overrule a majority
 	LearnAlways bool // learn from every decision, not just the decisive ones
 }
 
@@ -204,7 +221,9 @@ func (a *adaptive) Aggregate(_ cluster.Request, resps []cluster.Response) cluste
 		}
 		return w
 	}
-	d := prefixVote(resps, weight)
+	// A head-count majority is final: discounts and shared votes only
+	// decide what no majority settles.
+	d := prefixVoteGuarded(resps, weight, !a.opt.Unbounded)
 
 	// Learn only from requests that a strict majority of the answering
 	// nodes settled outright. Fewer than half the nodes cannot produce

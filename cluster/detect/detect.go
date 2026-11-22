@@ -94,6 +94,11 @@ func (c Config) Inspect(resps []cluster.Response) []Flag {
 			flags = append(flags, Flag{r.Node, Failed, 1})
 		}
 	}
+	// Work in a fixed order, not the order the responses arrived in. The
+	// tests below compare sums of similarities against thresholds, and a
+	// sum taken in a different order rounds differently — enough to move a
+	// borderline answer across one.
+	sort.SliceStable(answered, func(i, j int) bool { return answered[i].Node < answered[j].Node })
 	if len(answered) >= c.MinPeers {
 		n := len(answered)
 		sims := make([]float64, n)  // mean similarity to the other answers
@@ -102,12 +107,24 @@ func (c Config) Inspect(resps []cluster.Response) []Flag {
 		lens := make([]float64, n)
 		var reported []float64
 		counts := map[string]int{}
+		terms := make([]float64, 0, n)
 		for i, r := range answered {
+			// Add each node's similarities smallest first. Two nodes that
+			// gave the same answer have the same similarities to everyone
+			// else, met in a different order; summed as they come, their
+			// means can differ in the last bit and land on opposite sides
+			// of a threshold.
+			terms = terms[:0]
 			for j, o := range answered {
 				if i != j {
-					sims[i] += cluster.Similarity(r.Tokens, o.Tokens) / float64(n-1)
+					terms = append(terms, cluster.Similarity(r.Tokens, o.Tokens))
 				}
 			}
+			sort.Float64s(terms)
+			for _, s := range terms {
+				sims[i] += s
+			}
+			sims[i] /= float64(n - 1)
 			if p, ok := cluster.SeqConf(r.Conf); ok {
 				confs[i] = p
 				reported = append(reported, p)
@@ -128,7 +145,10 @@ func (c Config) Inspect(resps []cluster.Response) []Flag {
 		medConf := cluster.Median(reported)
 
 		for i, r := range answered {
-			if gap := medSim - sims[i]; gap >= c.SimGap && cluster.RobustZ(sims[i], sims) <= -c.SimZ {
+			// The gaps that can occur are a lattice (multiples of 1/96 for
+			// seven nodes and 16 tokens) and the threshold sits on it, so
+			// compare with a tolerance: a gap of exactly SimGap reaches it.
+			if gap := medSim - sims[i]; gap >= c.SimGap-1e-9 && cluster.RobustZ(sims[i], sims) <= -c.SimZ {
 				flags = append(flags, Flag{r.Node, Outlier, gap})
 			}
 			if 2*topCount > n && !cluster.Equal(r.Tokens, top) {

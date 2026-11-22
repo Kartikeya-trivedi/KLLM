@@ -221,6 +221,21 @@ func TokenVote() cluster.Aggregator {
 const endOfAnswer = int64(math.MinInt64) // sentinel "token": the answer stops here
 
 func prefixVote(resps []cluster.Response, weight func(cluster.Response) float64) cluster.Decision {
+	return prefixVoteGuarded(resps, weight, false)
+}
+
+// prefixVoteGuarded is prefixVote with one more rule when majorityFinal is
+// set: at each position, a token that more than half of the answering
+// nodes back is taken whatever the weights say. Weights then decide only
+// the contests no head-count majority settles — they can reorder
+// minorities, never overrule a majority. (With equal weights the rule
+// changes nothing: a majority of heads is a majority of the weight.)
+//
+// An answer given no weight at all has been set aside, and is not a
+// backer: it counts towards how many nodes answered, not towards any
+// token's support. So whatever the walk returns was given by at least one
+// node whose vote counted.
+func prefixVoteGuarded(resps []cluster.Response, weight func(cluster.Response) float64, majorityFinal bool) cluster.Decision {
 	type voter struct {
 		r cluster.Response
 		w float64
@@ -240,12 +255,13 @@ func prefixVote(resps []cluster.Response, weight func(cluster.Response) float64)
 	if total <= 0 {
 		return prefixVote(resps, one)
 	}
+	answered := len(alive) // every node that answered, set aside or not
 	d := cluster.Decision{Margin: 1}
 	for pos := 0; ; pos++ {
 		type option struct {
 			tok   int64
 			w     float64
-			heads int
+			heads int // backers that were not set aside
 		}
 		opts := map[int64]*option{}
 		for _, v := range alive {
@@ -259,7 +275,9 @@ func prefixVote(resps []cluster.Response, weight func(cluster.Response) float64)
 				opts[tok] = o
 			}
 			o.w += v.w
-			o.heads++
+			if v.w > 0 {
+				o.heads++
+			}
 		}
 		ranked := make([]*option, 0, len(opts))
 		for _, o := range opts {
@@ -267,6 +285,11 @@ func prefixVote(resps []cluster.Response, weight func(cluster.Response) float64)
 		}
 		sort.Slice(ranked, func(i, j int) bool {
 			a, b := ranked[i], ranked[j]
+			if majorityFinal { // at most one option can hold a majority
+				if ma, mb := 2*a.heads > answered, 2*b.heads > answered; ma != mb {
+					return ma
+				}
+			}
 			switch {
 			case math.Abs(a.w-b.w) > eps:
 				return a.w > b.w
@@ -275,8 +298,8 @@ func prefixVote(resps []cluster.Response, weight func(cluster.Response) float64)
 			}
 			return a.tok < b.tok
 		})
-		if len(ranked) > 1 { // the tightest contest along the path
-			d.Margin = math.Min(d.Margin, (ranked[0].w-ranked[1].w)/total)
+		if len(ranked) > 1 { // the tightest contest along the path; 0 where a majority overruled the weights
+			d.Margin = math.Min(d.Margin, math.Max(0, (ranked[0].w-ranked[1].w)/total))
 		}
 		best := ranked[0]
 		kept := alive[:0:0]
