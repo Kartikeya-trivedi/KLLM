@@ -30,6 +30,7 @@ from matplotlib.transforms import IdentityTransform
 SURFACE, GRID = "#fcfcfb", "#e7e6e2"
 TEXT, TEXT2 = "#0b0b0b", "#52514e"
 NEUTRAL = "#a3a29c"
+SPREAD_SHOWN = 5  # draw the range across seeds where it exceeds this many points
 
 # strategy -> (label, colour, marker). Fixed order: colour follows the strategy.
 STRATEGIES = {
@@ -77,11 +78,25 @@ def accuracy(cell, nodes, max_adv, out):
             ys.append(100 * float(row["exact_match"]) if row else None)
         return ys
 
+    def spread(attack, method):
+        """Lowest and highest single seed at each adversary count."""
+        out = []
+        for f in xs:
+            row = cell.get(("normal", 0, method)) if f == 0 else cell.get((attack, f, method))
+            out.append((100 * float(row["em_seed_min"]), 100 * float(row["em_seed_max"])) if row else None)
+        return out
+
     for ax, (attack, title) in zip(axes.flat, ATTACKS):
         style(ax)
         ax.yaxis.grid(True, color=GRID, linewidth=1)
         ax.plot(xs, series(attack, "single"), color=NEUTRAL, linewidth=1.5, zorder=2)
         for method, (_, colour, marker) in STRATEGIES.items():
+            # A pooled point can be an average of runs that held and runs that
+            # failed outright. Where the seeds disagree, show how far.
+            for x, span in zip(xs, spread(attack, method)):
+                if span and span[1] - span[0] > SPREAD_SHOWN:
+                    ax.plot([x, x], span, color=colour, linewidth=1.6, alpha=0.55, solid_capstyle="round",
+                            zorder=2.5, clip_on=False)
             ax.plot(xs, series(attack, method), color=colour, linewidth=2, marker=marker, markersize=8,
                     markeredgecolor=SURFACE, markeredgewidth=2, solid_capstyle="round",
                     solid_joinstyle="round", zorder=3, clip_on=False)
@@ -106,7 +121,10 @@ def accuracy(cell, nodes, max_adv, out):
                labelcolor=TEXT, bbox_to_anchor=(0.5, 0.945), handlelength=2.2, columnspacing=1.6)
     fig.suptitle("Accuracy as nodes turn adversarial", x=0.012, y=0.985, ha="left", fontsize=14,
                  color=TEXT, fontweight="bold")
-    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    fig.text(0.012, 0.014, f"Points are pooled over the seeds. A vertical line is the range between the worst and best "
+             f"single seed, drawn where they differ by more than {SPREAD_SHOWN} points.",
+             ha="left", va="bottom", fontsize=8.5, color=TEXT2)
+    fig.tight_layout(rect=(0, 0.035, 1, 0.9))
     fig.savefig(out, dpi=160, facecolor=SURFACE)
     plt.close(fig)
 
