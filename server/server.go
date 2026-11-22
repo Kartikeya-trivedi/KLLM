@@ -11,6 +11,7 @@ import (
 
 	"kllm/cluster"
 	"kllm/engine"
+	"kllm/engine/metrics"
 )
 
 //go:embed ui.html
@@ -92,7 +93,21 @@ func HandlerAs(s *engine.Scheduler, id Identity) http.Handler {
 	})
 	mux.HandleFunc("GET /stats.json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(s.Metrics().Snapshot())
+		snap := s.Metrics().Snapshot()
+		json.NewEncoder(w).Encode(struct {
+			metrics.Snapshot
+			// The same counters under the names the cluster's metrics
+			// sampler reads (cluster/node.Stats), so an engine node
+			// shows up in the system-metrics log like any other.
+			Node     string `json:"node"`
+			Model    string `json:"model"`
+			Requests uint64 `json:"requests"`
+			Tokens   uint64 `json:"tokens"`
+			InFlight int64  `json:"in_flight"`
+		}{snap, id.Node, id.Model, snap.RequestsTotal, snap.TokensTotal,
+			// admitted minus finished: the running/queued gauges hold the
+			// last batch's occupancy and are stale once the engine idles
+			int64(snap.RequestsTotal) - int64(snap.RequestsDone)})
 	})
 
 	// Browser playground (embedded; no external assets).

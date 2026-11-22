@@ -86,6 +86,15 @@ func TestInferServesTheEngineAsAClusterNode(t *testing.T) {
 	if r := c.Infer(context.Background(), cluster.Request{ID: "bad", MaxNewTokens: 4}); r.OK() {
 		t.Fatal("an empty prompt must be rejected")
 	}
+
+	// The engine's /stats.json must be readable by the cluster's sampler.
+	stats, err := c.Stats(context.Background())
+	if err != nil || stats.Node != "gpu0" || stats.Model != "tiny-llama" {
+		t.Fatalf("stats: %+v err=%v", stats, err)
+	}
+	if stats.Requests != uint64(len(got)) || stats.Tokens != uint64(len(got)*steps) || stats.InFlight != 0 {
+		t.Fatalf("engine counters not visible to the sampler: %+v", stats)
+	}
 }
 
 func TestArgmaxProbIsTheSoftmaxPeak(t *testing.T) {
