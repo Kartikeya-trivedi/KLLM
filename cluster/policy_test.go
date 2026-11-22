@@ -48,8 +48,8 @@ func TestOrderIsAPerRequestPermutation(t *testing.T) {
 		first[o[0]]++
 	}
 	for _, id := range ids {
-		if first[id] < 50 { // expect ~100 each
-			t.Fatalf("node %s is first on only %d/500 requests: %v", id, first[id], first)
+		if first[id] < 70 || first[id] > 130 { // uniform would be 100 each
+			t.Fatalf("node %s is first on %d/500 requests — the order is skewed: %v", id, first[id], first)
 		}
 	}
 

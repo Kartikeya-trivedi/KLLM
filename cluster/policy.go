@@ -91,8 +91,14 @@ func hash64(s string) uint64 {
 	for i := 0; i < len(s); i++ {
 		h = (h ^ uint64(s[i])) * 0x100000001b3
 	}
+	return mix64(h)
+}
+
+func mix64(h uint64) uint64 { // murmur3 finaliser: every input bit reaches every output bit
 	h ^= h >> 33
 	h *= 0xff51afd7ed558ccd
+	h ^= h >> 33
+	h *= 0xc4ceb9fe1a85ec53
 	return h ^ h>>33
 }
 
@@ -104,7 +110,10 @@ func Order(p Policy, req Request, ids []string, trust func(string) float64) []st
 	seed := hash64(req.ID)
 	rank := make(map[string]uint64, len(out))
 	for _, id := range out {
-		rank[id] = hash64(id) ^ seed*0x9e3779b97f4a7c15
+		// Mixed after combining: a bare XOR with a per-request constant
+		// would let a few bits of the seed decide the whole order, and
+		// some nodes would come first far more often than others.
+		rank[id] = mix64(hash64(id) ^ seed)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if p.Order == "trust" && trust != nil {

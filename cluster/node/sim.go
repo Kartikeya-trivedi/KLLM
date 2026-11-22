@@ -82,7 +82,9 @@ func (m SimModel) next(h uint64) (t1, t2 int32, p1, p2 float32) {
 	} else {
 		p1 = float32(0.80 + 0.195*w)
 	}
-	p2 = (1 - p1) * 0.85
+	// The runner-up takes most of what is left, but never out-scores the
+	// winner: at a close call it sits just below p1.
+	p2 = min((1-p1)*0.85, p1*0.9)
 	return
 }
 
@@ -121,10 +123,19 @@ func flipWeight(p1 float32) float64 {
 // replicas make identical ones, and no amount of voting helps. With
 // probability Corr a request's perturbation is drawn from a stream shared by
 // every replica instead of this replica's private one.
+//
+// OffPath is a modelling assumption, and the one confidence-based
+// aggregation depends on: once a decode has left the reference trajectory
+// it is in less probable territory, so the probabilities it reports from
+// then on are scaled by OffPath (0.9 by default). That makes a wrong answer
+// measurably, but only modestly, less confident than a right one — earlier
+// wrong turns more so than late ones. Set it to 1 to remove the signal and
+// see what confidence weighting is worth without it.
 type Sim struct {
 	M        SimModel
 	Noise    float64
 	Corr     float64
+	OffPath  float64
 	NodeSeed uint64
 
 	// Latency model: Overhead + tokens*TokenTime, scaled by lognormal
@@ -140,7 +151,7 @@ type Sim struct {
 // a 16-token answer, 25% jitter, and a 2% chance of a 4x stall.
 func NewSim(m SimModel, nodeSeed uint64, noise float64) *Sim {
 	return &Sim{
-		M: m, Noise: noise, NodeSeed: nodeSeed,
+		M: m, Noise: noise, NodeSeed: nodeSeed, OffPath: 0.9,
 		Overhead: 20 * time.Millisecond, TokenTime: 5 * time.Millisecond,
 		Jitter: 0.25, TailProb: 0.02, TailMult: 4,
 	}
@@ -172,11 +183,15 @@ func (s *Sim) Generate(ctx context.Context, req cluster.Request) (Output, error)
 		Conf:   make([]float32, 0, req.MaxNewTokens),
 		Label:  cluster.Label{Fault: FaultNone},
 	}
+	drift := float32(1) // becomes OffPath once the decode leaves the reference trajectory
 	for i := 0; i < req.MaxNewTokens; i++ {
 		t1, t2, p1, p2 := s.M.next(h)
-		tok, p := t1, p1
+		tok, p := t1, p1*drift
 		if unit(fold(stream, uint64(i))) < s.Noise*flipWeight(p1) {
-			tok, p = t2, p2
+			tok, p = t2, p2*drift
+			if s.OffPath > 0 {
+				drift = float32(s.OffPath)
+			}
 		}
 		out.Tokens = append(out.Tokens, tok)
 		out.Conf = append(out.Conf, p)
