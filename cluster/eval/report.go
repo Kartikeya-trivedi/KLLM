@@ -156,10 +156,10 @@ func (r Report) Markdown() string {
 
 	// Dispatch policies: what reliability costs.
 	fmt.Fprintf(&b, "## Dispatch policies: reliability against cost\n\n")
-	fmt.Fprintf(&b, "Latency and compute are measured with no adversary; the last columns show what each policy gives up under attack (%d adversaries).\n\n", min(2, s.MaxAdversaries))
+	fmt.Fprintf(&b, "Latency and compute are measured with no adversary; the remaining columns show what each policy gives up under attack.\n\n")
 	f2 := min(2, s.MaxAdversaries)
 	header = []string{"method", "EM", "p50 ms", "p99 ms", "nodes asked", "tokens/answer",
-		fmt.Sprintf("EM collude f=%d", f2), fmt.Sprintf("EM fast f=%d", f2),
+		fmt.Sprintf("EM collude f=%d", f2), fmt.Sprintf("EM fast f=%d", f2), fmt.Sprintf("EM sleeper f=%d", minority),
 		fmt.Sprintf("p99 ms straggler f=%d", f2), fmt.Sprintf("p99 ms crash f=%d", f2)}
 	rows = nil
 	shown := map[string]bool{}
@@ -181,7 +181,8 @@ func (r Report) Markdown() string {
 		}
 		rows = append(rows, []string{name, pct(c.ExactMatch), fmt.Sprintf("%.0f", c.LatencyP50), fmt.Sprintf("%.0f", c.LatencyP99),
 			fmt.Sprintf("%.2f", c.NodeCalls), fmt.Sprintf("%.1f", c.Tokens),
-			cell("collude", f2, name, em), cell("fast", f2, name, em), ms("straggler"), ms("crash")})
+			cell("collude", f2, name, em), cell("fast", f2, name, em), cell("sleeper", minority, name, em),
+			ms("straggler"), ms("crash")})
 	}
 	for _, m := range dispatched { // each policy next to its wait-for-all counterpart
 		add(Method{Aggregator: m.Aggregator})
